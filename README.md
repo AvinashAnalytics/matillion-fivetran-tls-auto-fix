@@ -1,6 +1,6 @@
 # Daily Fivetran TLS Fix Pipeline — Complete Technical Blueprint
 
-**Author:** Maia (AI Pipeline Architect) for Avinash @ Inupup
+**Author:** Maia (AI Pipeline Architect) for Avinash 
 **Version:** 3.0 (Zero-Python, Maximum Components)
 **Date:** 2026-03-27
 **Schedule:** Daily at 3:00 AM IST (9:30 PM UTC previous day)
@@ -1523,22 +1523,22 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant ROW as Input Row
-    participant END as Extract Nested Data
+    participant EXT as Extract Nested Data
     participant OUT as Output Row
 
-    ROW->>END: Row with 'status' column = VARIANT JSON blob
+    ROW->>EXT: Row with status column as VARIANT JSON blob
 
-    Note over END: Reads configuration: extract these fields from 'status' column
+    Note over EXT: Reads configuration: extract these fields from status column
 
-    END->>END: Extract status.setup_state as VARCHAR to STATUS_SETUP_STATE
-    END->>END: Extract status.tasks as VARIANT to STATUS_TASKS
-    END->>END: Extract status.warnings as VARIANT to STATUS_WARNINGS
-    END->>END: Extract status.setup_tests as VARIANT to SETUP_TESTS
+    EXT->>EXT: Extract status.setup_state as VARCHAR to STATUS_SETUP_STATE
+    EXT->>EXT: Extract status.tasks as VARIANT to STATUS_TASKS
+    EXT->>EXT: Extract status.warnings as VARIANT to STATUS_WARNINGS
+    EXT->>EXT: Extract status.setup_tests as VARIANT to SETUP_TESTS
 
-    Note over END: Casting - if any value cannot be parsed, replace with NULL
-    Note over END: Outer join - keep the row even if some fields are missing
+    Note over EXT: Casting - if any value cannot be parsed, replace with NULL
+    Note over EXT: Outer join - keep the row even if some fields are missing
 
-    END->>OUT: Original 11 columns plus 4 new extracted columns equals 15 columns
+    EXT->>OUT: Original 11 columns plus 4 new extracted columns equals 15 columns
 ```
 
 ### Table Iterator — How the Loop Works
