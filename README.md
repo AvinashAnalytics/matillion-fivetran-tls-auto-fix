@@ -1,1141 +1,882 @@
-# Daily Fivetran TLS Fix Pipeline — Complete Build Document
+# Daily Fivetran TLS Fix Pipeline — Complete Technical Blueprint
 
-**Author:** Maia (AI Pipeline Architect)  
-**Prepared for:** Avinash, Data Engineer 
+**Author:** Maia (AI Pipeline Architect) for Avinash @ Inupup  
+**Version:** 3.0 (Zero-Python, Maximum Components)  
 **Date:** 2026-03-27  
-**Pipeline Name:** `Daily_Fivetran_TLS_Fix`  
-**Warehouse:** Snowflake (TRIAL_18E299FB043A4435A6C9BC2959CE62E4)  
-**Schedule:** Daily at 3:00 AM IST (9:30 PM UTC previous day)
+**Schedule:** Daily at 3:00 AM IST (9:30 PM UTC previous day)  
+**Total:** 3 pipelines, 22 components, 13 variables, 0 Python scripts
 
 ---
 
 ## Table of Contents
 
-1. [Executive Summary](#1-executive-summary)
+1. [Real Fivetran API Response Structure](#1-real-fivetran-api-response-structure)
 2. [Architecture Overview](#2-architecture-overview)
-3. [Custom Connectors (API Configuration)](#3-custom-connectors-api-configuration)
-4. [Orchestration Pipeline: Daily_Fivetran_TLS_Fix](#4-orchestration-pipeline-daily_fivetran_tls_fix)
-5. [Transformation Pipeline: Flatten_and_Filter_Broken_TLS](#5-transformation-pipeline-flatten_and_filter_broken_tls)
-6. [Sub-Orchestration Pipeline: Validate_TLS_Connection](#6-sub-orchestration-pipeline-validate_tls_connection)
-7. [Watermark Logic — Detailed Explanation](#7-watermark-logic--detailed-explanation)
-8. [Filter Logic — Detailed Explanation](#8-filter-logic--detailed-explanation)
-9. [Loop Logic — Detailed Explanation](#9-loop-logic--detailed-explanation)
-10. [Complete Component Inventory & Connection Map](#10-complete-component-inventory--connection-map)
-11. [Variables Reference](#11-variables-reference)
-12. [Log Table Schema](#12-log-table-schema)
-13. [Snowflake Prerequisites](#13-snowflake-prerequisites)
-14. [Error Handling Strategy](#14-error-handling-strategy)
-15. [Scheduling & Notification](#15-scheduling--notification)
+3. [Step-by-Step Data Flow with Sample Data](#3-step-by-step-data-flow-with-sample-data)
+4. [Pipeline 1: Main Orchestration](#4-pipeline-1-main-orchestration)
+5. [Pipeline 2: Transformation](#5-pipeline-2-transformation)
+6. [Pipeline 3: Validation Sub-Orchestration](#6-pipeline-3-validation-sub-orchestration)
+7. [How Each Component Works Internally](#7-how-each-component-works-internally)
+8. [Log Table Schema & Partitioning Strategy](#8-log-table-schema--partitioning-strategy)
+9. [Pipeline Variables Reference](#9-pipeline-variables-reference)
+10. [Setup Instructions](#10-setup-instructions)
+11. [Error Handling & Edge Cases](#11-error-handling--edge-cases)
+12. [Version History](#12-version-history)
 
 ---
 
-## 1. Executive Summary
+## 1. Real Fivetran API Response Structure
 
-This document describes the complete, production-ready architecture for a daily automated pipeline that:
+### Endpoint: `GET /v1/connectors`
 
-1. **Fetches** all Fivetran connections via the Fivetran REST API (with pagination).
-2. **Loads** the raw JSON response into a Snowflake staging table.
-3. **Flattens** the nested JSON structure into relational columns.
-4. **Filters** for connections broken specifically due to TLS, SSL, or certificate issues.
-5. **Appends** those broken connections into a historical log table with a `CHECK_DATE` (today) and `WATERMARK_DATE` (exact timestamp), enabling daily partitioning and deduplication.
-6. **Loops** through only today's unvalidated broken IDs and calls the Fivetran test endpoint with `trust_certificates = true`.
-7. **Logs** each validation result back into the log table.
-8. **Generates** a summary report with counts of broken, fixed, and failed connections for the day.
+**Authentication:** HTTP Basic Auth (API Key as username, API Secret as password)  
+**Pagination:** Cursor-based (`next_cursor` in response, `cursor` query param for next page)  
+**Docs:** [Fivetran API — List All Connectors](https://fivetran.com/docs/rest-api/connectors#listallconnectorswithinagroup)
 
-The pipeline is built across **3 files**:
+### Response Structure Map
 
-| File | Type | Purpose |
-|---|---|---|
-| `Daily_Fivetran_TLS_Fix.orch.yaml` | Orchestration | Main pipeline — coordinates all steps |
-| `Flatten_and_Filter_Broken_TLS.tran.yaml` | Transformation | Flattens JSON, filters TLS errors, adds watermark |
-| `Validate_TLS_Connection.orch.yaml` | Orchestration | Sub-pipeline called per broken ID by the iterator |
+```mermaid
+flowchart TB
+    ROOT["GET /v1/connectors Response"] --> CODE["code: 'Success'"]
+    ROOT --> DATA["data"]
+    DATA --> ITEMS["items: Array of Connection Objects"]
+    DATA --> CURSOR["next_cursor: string | null"]
+
+    ITEMS --> CONN["Each Connection Object"]
+    CONN --> ID["id: 'relief_harden'<br><b>Unique connector ID</b>"]
+    CONN --> SVC["service: 'google_sheets'<br><b>Connector type</b>"]
+    CONN --> GID["group_id: 'group_abc123'"]
+    CONN --> SCH["schema: 'google_sheets_schema'"]
+    CONN --> CB["connected_by: 'user_abc'"]
+    CONN --> CT["created_at: '2023-01-15T...'"]
+    CONN --> SS["setup_state: 'broken'<br><b>Top-level state</b>"]
+    CONN --> PAUSED["paused: false"]
+    CONN --> CFG["config: { ... }"]
+    CONN --> STATUS["status: { ... }<br><b>Nested status object</b>"]
+
+    STATUS --> SSS["setup_state: 'broken'<br><b>Status-level state</b>"]
+    STATUS --> TASKS["tasks: Array<br><b>Active error tasks</b>"]
+    STATUS --> WARN["warnings: Array<br><b>Active warnings</b>"]
+    STATUS --> TESTS["setup_tests: Array<br><b>Setup test results</b>"]
+    STATUS --> SYNC["sync_state: 'paused'"]
+    STATUS --> UPD["update_state: 'on_schedule'"]
+    STATUS --> HIST["is_historical_sync: false"]
+
+    TASKS --> TC["{ code: 'reconnect',<br>  message: 'TLS certificate...' }"]
+    WARN --> WC["{ code: 'cert_warning',<br>  message: 'SSL validation...' }"]
+    TESTS --> TS["{ title: 'Connecting to host',<br>  status: 'FAILED',<br>  message: 'certificate verify failed' }"]
+
+    style ID fill:#d4edda,stroke:#28a745,color:#000
+    style SVC fill:#d4edda,stroke:#28a745,color:#000
+    style SS fill:#fff3cd,stroke:#ffc107,color:#000
+    style STATUS fill:#fff3cd,stroke:#ffc107,color:#000
+    style SSS fill:#d4edda,stroke:#28a745,color:#000
+    style TASKS fill:#f8d7da,stroke:#dc3545,color:#000
+    style WARN fill:#f8d7da,stroke:#dc3545,color:#000
+    style TESTS fill:#f8d7da,stroke:#dc3545,color:#000
+```
+
+### Real Sample Response (Based on Fivetran API Documentation)
+
+This is the structure returned by the real Fivetran API. The `status` object is the key nested structure our pipeline must parse:
+
+```json
+{
+  "code": "Success",
+  "data": {
+    "items": [
+      {
+        "id": "relief_harden",
+        "service": "mysql_rds",
+        "group_id": "group_projection",
+        "schema": "mysql_rds_schema",
+        "connected_by": "concerning_gate",
+        "created_at": "2024-03-15T10:22:00.000Z",
+        "succeeded_at": null,
+        "failed_at": "2026-03-27T02:15:33.000Z",
+        "paused": false,
+        "pause_after_trial": false,
+        "setup_state": "broken",
+        "config": {
+          "host": "db.example.com",
+          "port": 3306,
+          "database": "production",
+          "user": "fivetran_user"
+        },
+        "status": {
+          "setup_state": "broken",
+          "sync_state": "paused",
+          "update_state": "delayed",
+          "is_historical_sync": false,
+          "tasks": [
+            {
+              "code": "reconnect",
+              "message": "Connection to source failed: TLS certificate validation failed — the server certificate is not trusted by the client"
+            }
+          ],
+          "warnings": [],
+          "setup_tests": [
+            {
+              "title": "Connecting to SSH tunnel",
+              "status": "PASSED",
+              "message": ""
+            },
+            {
+              "title": "Connecting to host",
+              "status": "FAILED",
+              "message": "SSL certificate verify failed: unable to get local issuer certificate"
+            },
+            {
+              "title": "Validating certificate",
+              "status": "FAILED",
+              "message": "Certificate chain validation failed: self-signed certificate in certificate chain"
+            }
+          ]
+        }
+      },
+      {
+        "id": "liquid_drop",
+        "service": "postgres_rds",
+        "group_id": "group_projection",
+        "schema": "postgres_schema",
+        "connected_by": "concerning_gate",
+        "created_at": "2024-06-01T08:00:00.000Z",
+        "succeeded_at": "2026-03-27T01:00:00.000Z",
+        "failed_at": null,
+        "paused": false,
+        "setup_state": "connected",
+        "config": {
+          "host": "pg.example.com",
+          "port": 5432
+        },
+        "status": {
+          "setup_state": "connected",
+          "sync_state": "scheduled",
+          "update_state": "on_schedule",
+          "is_historical_sync": false,
+          "tasks": [],
+          "warnings": [],
+          "setup_tests": [
+            {
+              "title": "Connecting to host",
+              "status": "PASSED",
+              "message": ""
+            }
+          ]
+        }
+      },
+      {
+        "id": "warm_feather",
+        "service": "sql_server_rds",
+        "group_id": "group_projection",
+        "schema": "sqlserver_schema",
+        "connected_by": "concerning_gate",
+        "created_at": "2025-01-10T14:30:00.000Z",
+        "succeeded_at": null,
+        "failed_at": "2026-03-27T02:45:00.000Z",
+        "paused": false,
+        "setup_state": "broken",
+        "config": {
+          "host": "sqlsrv.example.com",
+          "port": 1433
+        },
+        "status": {
+          "setup_state": "broken",
+          "sync_state": "paused",
+          "update_state": "delayed",
+          "is_historical_sync": false,
+          "tasks": [
+            {
+              "code": "reconnect",
+              "message": "SSL/TLS handshake failed: the certificate authority is not trusted"
+            }
+          ],
+          "warnings": [
+            {
+              "code": "cert_expiry",
+              "message": "Server certificate expires in 3 days"
+            }
+          ],
+          "setup_tests": [
+            {
+              "title": "Connecting to host",
+              "status": "FAILED",
+              "message": "TLS handshake error: certificate signed by unknown authority"
+            }
+          ]
+        }
+      },
+      {
+        "id": "bright_storm",
+        "service": "google_analytics",
+        "group_id": "group_analytics",
+        "schema": "ga4_schema",
+        "connected_by": "concerning_gate",
+        "created_at": "2025-06-20T09:00:00.000Z",
+        "succeeded_at": null,
+        "failed_at": "2026-03-27T03:00:00.000Z",
+        "paused": false,
+        "setup_state": "broken",
+        "config": {},
+        "status": {
+          "setup_state": "broken",
+          "sync_state": "paused",
+          "update_state": "delayed",
+          "is_historical_sync": false,
+          "tasks": [
+            {
+              "code": "reconnect",
+              "message": "OAuth token expired. Please re-authenticate."
+            }
+          ],
+          "warnings": [],
+          "setup_tests": [
+            {
+              "title": "Authenticating",
+              "status": "FAILED",
+              "message": "Invalid credentials"
+            }
+          ]
+        }
+      }
+    ],
+    "next_cursor": null
+  }
+}
+```
+
+> **Key insight:** `bright_storm` is broken but NOT due to TLS — it's an OAuth issue. Our filter must correctly **exclude** it. Only `relief_harden` and `warm_feather` have TLS/SSL/certificate keywords.
 
 ---
 
 ## 2. Architecture Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    MAIN ORCHESTRATION PIPELINE                              │
-│                    Daily_Fivetran_TLS_Fix.orch.yaml                        │
-│                                                                             │
-│  [Start]                                                                    │
-│    │                                                                        │
-│    ▼                                                                        │
-│  [Create Log Table]  ──── CREATE TABLE IF NOT EXISTS                       │
-│    │                       FIVETRAN_TLS_BROKEN_LOG                          │
-│    ▼                                                                        │
-│  [Fetch Connections via API]  ──── Python Pushdown                         │
-│    │                               GET /v1/connections (paginated)          │
-│    │                               → RAW_FIVETRAN_CONNECTIONS               │
-│    ▼                                                                        │
-│  [Run Flatten and Filter]  ──── Calls transformation pipeline              │
-│    │                             Flatten_and_Filter_Broken_TLS.tran.yaml   │
-│    │                             → FIVETRAN_TLS_BROKEN_STAGING              │
-│    ▼                                                                        │
-│  [Insert Staging into Log]  ──── SQL Script                                │
-│    │                              INSERT INTO FIVETRAN_TLS_BROKEN_LOG      │
-│    │                              (deduplicates against today's entries)    │
-│    ▼                                                                        │
-│  [Loop Today's Broken IDs]  ──── Table Iterator (Advanced mode)            │
-│    │                              SELECT ... WHERE CHECK_DATE = TODAY       │
-│    │                              AND VALIDATED = FALSE                     │
-│    │                                                                        │
-│    │  ┌─── Iterator Target ───────────────────────────────────┐            │
-│    │  │  [Validate Each Connection]                            │            │
-│    │  │   Run Orchestration →                                  │            │
-│    │  │   Validate_TLS_Connection.orch.yaml                    │            │
-│    │  │   (passes broken_id, connector_name, service,          │            │
-│    │  │    fivetran_api_key, fivetran_api_secret)               │            │
-│    │  └────────────────────────────────────────────────────────┘            │
-│    │                                                                        │
-│    ▼                                                                        │
-│  [Send Summary Notification]  ──── SQL Script                              │
-│                                    Creates FIVETRAN_TLS_DAILY_SUMMARY      │
-└─────────────────────────────────────────────────────────────────────────────┘
+### System Architecture
 
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    TRANSFORMATION PIPELINE                                  │
-│                    Flatten_and_Filter_Broken_TLS.tran.yaml                 │
-│                                                                             │
-│  [Load Raw Connections]                                                     │
-│    │  Table Input ← RAW_FIVETRAN_CONNECTIONS (DATA column)                 │
-│    ▼                                                                        │
-│  [Flatten Connection Items]                                                 │
-│    │  Flatten Variant → explode data.items[] array                         │
-│    │  Extract: id, name, service, setup_state, status, setup_tests         │
-│    ▼                                                                        │
-│  [Filter TLS Broken Only]                                                   │
-│    │  Advanced Filter → setup_state='broken' AND error contains            │
-│    │  'tls' OR 'certificate' OR 'ssl'                                      │
-│    ▼                                                                        │
-│  [Add Watermark Columns]                                                    │
-│    │  Calculator → adds CHECK_DATE, WATERMARK_DATE, VALIDATED=FALSE        │
-│    ▼                                                                        │
-│  [Append to Log Table]                                                      │
-│     Rewrite Table → FIVETRAN_TLS_BROKEN_STAGING                            │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph EXT ["☁️ External Services"]
+        FIV[("Fivetran REST API<br>api.fivetran.com")]
+        SLK["Slack<br>Webhook"]
+        EML["Email<br>SMTP"]
+        SNS["AWS<br>SNS"]
+    end
 
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    SUB-ORCHESTRATION PIPELINE                               │
-│                    Validate_TLS_Connection.orch.yaml                       │
-│                    (Called once per broken connection ID)                    │
-│                                                                             │
-│  [Start]                                                                    │
-│    │                                                                        │
-│    ▼                                                                        │
-│  [Call Fivetran Test API]  ──── Python Pushdown                            │
-│    │                            POST /v1/connections/{broken_id}/test       │
-│    │                            Body: {"trust_certificates": true}          │
-│    │                            Auth: Basic (API key + secret)              │
-│    │                                                                        │
-│    ├── success ──▶ [Update Log with Result]                                │
-│    │                SQL Script → SET VALIDATED=TRUE,                        │
-│    │                VALIDATION_RESULT = <API response JSON>                 │
-│    │                                                                        │
-│    └── failure ──▶ [Log Failure]                                           │
-│                     SQL Script → SET VALIDATED=TRUE,                        │
-│                     VALIDATION_RESULT = {"error": "API call failed..."}     │
-└─────────────────────────────────────────────────────────────────────────────┘
+    subgraph MAIN ["📋 Main Orchestration — fivetran_tls_daily_fix.orch.yaml"]
+        direction LR
+        S["Start"] --> INIT["Init Log<br>Table"]
+        INIT --> FETCH["Fetch All<br>Connections"]
+        FETCH --> TRUN["Transform<br>& Filter"]
+        TRUN --> MERGE["Merge Into<br>Log"]
+        MERGE --> ITER["Iterate<br>Broken IDs"]
+        ITER --> COUNT["Count<br>Results"]
+        COUNT --> NOTIF["Triple<br>Notification"]
+        NOTIF --> CLEAN["Cleanup"]
+    end
+
+    subgraph TRAN ["🔀 Transformation — fivetran_tls_transform.tran.yaml"]
+        direction LR
+        TI["Table<br>Input"] --> END2["Extract<br>Nested Data"]
+        END2 --> CALC["Rename<br>Fields"]
+        CALC --> FILT["Filter TLS<br>Broken"]
+        FILT --> WM["Add<br>Watermarks"]
+        WM --> RW["Write to<br>Staging"]
+    end
+
+    subgraph SUB ["🔄 Validation — Validate_TLS_Connection.orch.yaml"]
+        direction LR
+        S2["Start"] --> WH["Webhook POST<br>trust_certificates"]
+        WH -- "✅" --> FIX["Mark Fixed"]
+        WH -- "❌" --> FAIL["Mark Failed"]
+    end
+
+    subgraph DWH ["❄️ Snowflake"]
+        RAW[("RAW_FIVETRAN<br>_CONNECTIONS")]
+        STG[("FIVETRAN_TLS<br>_BROKEN_STAGING")]
+        LOG[("FIVETRAN_TLS<br>_BROKEN_LOG")]
+    end
+
+    FIV -- "GET /v1/connectors" --> FETCH
+    TRUN -.-> TRAN
+    ITER -.-> SUB
+    SUB -- "POST /test" --> FIV
+    NOTIF --> SLK & EML & SNS
+
+    FETCH --> RAW
+    TRAN --> STG
+    MERGE --> LOG
+    SUB --> LOG
+
+    style EXT fill:#e8f4fd,stroke:#0d6efd,color:#000
+    style DWH fill:#e0f0ff,stroke:#0d6efd,color:#000
+    style MAIN fill:#f8f9fa,stroke:#6c757d,color:#000
+    style TRAN fill:#f0fff0,stroke:#28a745,color:#000
+    style SUB fill:#fff8f0,stroke:#fd7e14,color:#000
 ```
 
----
+### Component Inventory
 
-## 3. Custom Connectors (API Configuration)
+| # | Component | Type ID | Pipeline | Purpose |
+|---|---|---|---|---|
+| 1 | Start | `start` | Main | Entry point |
+| 2 | Init Log Table | `create-table-v2` | Main | CREATE TABLE IF NOT EXISTS |
+| 3 | Fetch All Connections | Custom Connector* | Main | GET /v1/connectors |
+| 4 | Transform and Filter | `run-transformation` | Main | Runs transformation pipeline |
+| 5 | Merge Into Log | `sql-executor` | Main | MERGE INTO (dedup) |
+| 6 | Iterate Broken IDs | `table-iterator` | Main | Loop today's broken IDs |
+| 7 | Validate Connection | `run-orchestration` | Main | Iterator target → sub-pipeline |
+| 8 | Count Results | `sql-executor` | Main | SET summary variables |
+| 9 | Notify Slack | `webhook-post` | Main | Slack notification |
+| 10 | Send Email Report | `send-email-v2` | Main | Email via SMTP |
+| 11 | SNS Alert | `sns-message` | Main | AWS SNS notification |
+| 12 | Cleanup Staging | `sql-executor` | Main | DROP temp tables |
+| 13 | Load Raw Connections | `table-input` | Transform | Read RAW table |
+| 14 | Extract Status Fields | `extract-nested-data-sf` | Transform | Unpack status JSON |
+| 15 | Rename Connector Fields | `calculator` | Transform | Alias column names |
+| 16 | Filter TLS Broken Only | `filter` | Transform | TLS/SSL/cert filter |
+| 17 | Add Watermark Columns | `calculator` | Transform | CHECK_DATE + WATERMARK |
+| 18 | Write to Staging | `rewrite-table` | Transform | Output to staging |
+| 19 | Start | `start` | Validate | Entry point |
+| 20 | Test Connection | `webhook-post` | Validate | POST /test API |
+| 21 | Mark as Fixed | `sql-executor` | Validate | UPDATE → success |
+| 22 | Mark as Failed | `sql-executor` | Validate | UPDATE → failed |
 
-### Why Python Pushdown Instead of Custom Connectors
-
-After thorough analysis, we use **Python Pushdown** components instead of Matillion Custom Connectors for the Fivetran API calls. Here is why:
-
-| Concern | Custom Connector | Python Pushdown (Chosen) |
-|---|---|---|
-| **Pagination** | No built-in cursor-based pagination for Fivetran's API | Full control — loop until `next_cursor` is null |
-| **Dynamic URI parameters** | Known limitation: Configurable URI params may fail validation at runtime | Full control — `f-string` interpolation in Python |
-| **POST with body** | Limited body customization | Full control — `requests.post(json=payload)` |
-| **Error handling** | Limited — binary success/fail | Try/except with detailed error capture |
-| **Secrets** | Auth entered at connector level | Variables passed from parent pipeline |
-
-### However — If You Still Want Custom Connectors
-
-For reference, here are the exact configurations if you prefer to create them in the Custom Connector UI:
-
-#### Connector 1: `Fivetran_List_Connections`
-
-| Setting | Value |
-|---|---|
-| **Connector Name** | `Fivetran_List_Connections` |
-| **Method** | GET |
-| **URL** | `https://api.fivetran.com/v1/connections` |
-| **Authentication** | Basic Auth |
-| **Username** | Fivetran API Key (from Matillion Secret Definition) |
-| **Password** | Fivetran API Secret (from Matillion Secret Definition) |
-| **Query Parameters** | `limit` = `1000` (Constant) |
-| **Response Format** | JSON |
-| **Pagination** | Not natively supported — requires manual cursor handling |
-
-> **Limitation:** This connector fetches only the first page (up to 1000 connections). If you have more than 1000 connections, you would need to handle `cursor`-based pagination externally — which is why Python Pushdown is the superior choice.
-
-#### Connector 2: `Fivetran_Fix_TLS`
-
-| Setting | Value |
-|---|---|
-| **Connector Name** | `Fivetran_Fix_TLS` |
-| **Method** | POST |
-| **URL** | `https://api.fivetran.com/v1/connections/{connectionId}/test` |
-| **Authentication** | Basic Auth |
-| **Username** | Fivetran API Key (from Matillion Secret Definition) |
-| **Password** | Fivetran API Secret (from Matillion Secret Definition) |
-| **URI Parameter** | `connectionId` → Configurable (set at pipeline runtime) |
-| **Request Body** | `{ "trust_certificates": true }` |
-| **Response Format** | JSON |
-
-> **⚠️ Known Limitation:** Configurable URI parameters in Custom Connectors may fail validation during pipeline execution. This is a documented Matillion platform limitation. The Python Pushdown approach avoids this entirely.
+> *Currently a SQL placeholder — replace with your Custom Connector after UI setup.
 
 ---
 
-## 4. Orchestration Pipeline: Daily_Fivetran_TLS_Fix
+## 3. Step-by-Step Data Flow with Sample Data
 
-**File:** `Daily_Fivetran_TLS_Fix.orch.yaml`  
-**Type:** Orchestration  
-**Purpose:** Main daily coordinator pipeline
+This section traces the **exact data** through every component using the 4-connector sample from Section 1.
 
-### Step-by-Step Component Breakdown
+### Step 1: Fetch All Connections → `RAW_FIVETRAN_CONNECTIONS`
 
----
+The Custom Connector calls `GET /v1/connectors` and loads each connection as a row. After the connector loads, the raw table looks like:
 
-### Step 1: Start
+| id | service | schema | setup_state | status (VARIANT) |
+|---|---|---|---|---|
+| relief_harden | mysql_rds | mysql_rds_schema | broken | `{"setup_state":"broken","tasks":[{"code":"reconnect","message":"TLS certificate validation failed..."}],...}` |
+| liquid_drop | postgres_rds | postgres_schema | connected | `{"setup_state":"connected","tasks":[],"warnings":[],"setup_tests":[{"title":"Connecting","status":"PASSED",...}]}` |
+| warm_feather | sql_server_rds | sqlserver_schema | broken | `{"setup_state":"broken","tasks":[{"code":"reconnect","message":"SSL/TLS handshake failed..."}],...}` |
+| bright_storm | google_analytics | ga4_schema | broken | `{"setup_state":"broken","tasks":[{"code":"reconnect","message":"OAuth token expired..."}],...}` |
 
-| Property | Value |
-|---|---|
-| **Component** | [Start](https://docs.matillion.com/data-productivity-cloud/designer/docs/start) |
-| **Type** | `start` |
-| **Transition** | Unconditional → `Create Log Table` |
-| **Purpose** | Entry point for the pipeline |
+**4 rows loaded.** All connectors, regardless of state.
 
----
+### Step 2: Extract Nested Data → Unpacks `status` JSON
 
-### Step 2: Create Log Table
+The [Extract Nested Data](https://docs.matillion.com/data-productivity-cloud/designer/docs/extract-nested-data-sf) component reads the `status` VARIANT column and extracts nested fields into new columns:
 
-| Property | Value |
-|---|---|
-| **Component** | [Create Table](https://docs.matillion.com/data-productivity-cloud/designer/docs/create-table-v2) |
-| **Type** | `create-table-v2` |
-| **Create Method** | `Create If Not Exists` |
-| **Database** | `[Environment Default]` |
-| **Schema** | `[Environment Default]` |
-| **Table Name** | `FIVETRAN_TLS_BROKEN_LOG` |
-| **Table Type** | Permanent |
-| **Transition** | Success → `Fetch Connections via API` |
+| id | service | setup_state | status | **STATUS_SETUP_STATE** | **STATUS_TASKS** | **STATUS_WARNINGS** | **SETUP_TESTS** |
+|---|---|---|---|---|---|---|---|
+| relief_harden | mysql_rds | broken | {...} | broken | `[{"code":"reconnect","message":"TLS certificate validation failed..."}]` | `[]` | `[{"title":"Connecting to host","status":"FAILED","message":"SSL certificate verify failed..."}]` |
+| liquid_drop | postgres_rds | connected | {...} | connected | `[]` | `[]` | `[{"title":"Connecting","status":"PASSED",...}]` |
+| warm_feather | sql_server_rds | broken | {...} | broken | `[{"code":"reconnect","message":"SSL/TLS handshake failed..."}]` | `[{"code":"cert_expiry",...}]` | `[{"title":"Connecting","status":"FAILED","message":"TLS handshake error..."}]` |
+| bright_storm | google_analytics | broken | {...} | broken | `[{"code":"reconnect","message":"OAuth token expired"}]` | `[]` | `[{"title":"Authenticating","status":"FAILED","message":"Invalid credentials"}]` |
 
-**Why this step exists:**  
-On the very first run, the log table won't exist yet. Using `Create If Not Exists` ensures the table is created on first run and safely skipped on all subsequent runs. This makes the pipeline idempotent.
+**Still 4 rows.** But now the nested `status` fields are exposed as queryable columns.
 
-**Columns:** See [Section 12: Log Table Schema](#12-log-table-schema) for full column definitions.
+### Step 3: Rename Fields → Calculator adds aliases
 
-**Primary Key:** (`CHECK_DATE`, `BROKEN_ID`) — ensures one entry per connection per day.
+| **BROKEN_ID** | **CONNECTOR_SERVICE** | **CONNECTOR_SETUP_STATE** | **ERROR_REASON** | STATUS_SETUP_STATE | STATUS_TASKS | STATUS_WARNINGS | SETUP_TESTS |
+|---|---|---|---|---|---|---|---|
+| relief_harden | mysql_rds | broken | `{"setup_state":"broken",...}` | broken | [...] | [] | [...] |
+| liquid_drop | postgres_rds | connected | `{"setup_state":"connected",...}` | connected | [] | [] | [...] |
+| warm_feather | sql_server_rds | broken | `{"setup_state":"broken",...}` | broken | [...] | [...] | [...] |
+| bright_storm | google_analytics | broken | `{"setup_state":"broken",...}` | broken | [...] | [] | [...] |
 
----
+**Still 4 rows.** Columns renamed for clarity.
 
-### Step 3: Fetch Connections via API
+### Step 4: Filter TLS Broken Only → The Critical Step
 
-| Property | Value |
-|---|---|
-| **Component** | [Python Pushdown](https://docs.matillion.com/data-productivity-cloud/designer/docs/python-pushdown) |
-| **Type** | `python-pushdown` |
-| **External Access Integration** | `FIVETRAN_API_ACCESS` (Snowflake-level config) |
-| **Python Version** | 3.11 |
-| **Packages** | `requests` |
-| **Variable Resolution** | Enabled (`Yes`) |
-| **Script Timeout** | 360 seconds |
-| **Transition** | Success → `Run Flatten and Filter` |
+The filter applies this logic:
 
-**What the script does:**
+```mermaid
+flowchart TB
+    A["4 connectors"] --> B{"setup_state = 'broken'<br>OR status.setup_state = 'broken'?"}
+    B -- "No: liquid_drop" --> SKIP1["❌ SKIP<br>liquid_drop<br>connected"]
+    B -- "Yes: 3 connectors" --> C{"TLS/SSL/certificate keywords<br>in tasks, warnings, setup_tests,<br>or error_reason?"}
 
-1. Reads `${fivetran_api_key}` and `${fivetran_api_secret}` from pipeline variables.
-2. Calls `GET https://api.fivetran.com/v1/connections?limit=1000`.
-3. **Paginates** — if the response contains a `next_cursor`, it fetches the next page and appends results.
-4. Continues until all connections are collected.
-5. Creates/replaces `RAW_FIVETRAN_CONNECTIONS` table with a single VARIANT column (`DATA`).
-6. Inserts the complete JSON payload as `PARSE_JSON('{...}')`.
-7. Prints the count of loaded connections for task logging.
+    C -- "relief_harden" --> D1["✅ MATCH<br>tasks: 'TLS certificate validation failed'<br>setup_tests: 'SSL certificate verify failed'"]
+    C -- "warm_feather" --> D2["✅ MATCH<br>tasks: 'SSL/TLS handshake failed'<br>setup_tests: 'TLS handshake error'<br>warnings: cert_expiry"]
+    C -- "bright_storm" --> D3["❌ SKIP<br>tasks: 'OAuth token expired'<br>setup_tests: 'Invalid credentials'<br>No TLS/SSL/cert keywords!"]
 
-**Pseudocode:**
-```
-all_items = []
-cursor = None
-LOOP:
-    GET /v1/connections?limit=1000&cursor={cursor}
-    all_items += response.data.items
-    cursor = response.data.next_cursor
-    IF cursor IS NULL → BREAK
-END LOOP
-
-CREATE OR REPLACE TABLE RAW_FIVETRAN_CONNECTIONS (DATA VARIANT)
-INSERT INTO RAW_FIVETRAN_CONNECTIONS SELECT PARSE_JSON('{items: all_items}')
+    style SKIP1 fill:#f8d7da,stroke:#dc3545,color:#000
+    style D3 fill:#f8d7da,stroke:#dc3545,color:#000
+    style D1 fill:#d4edda,stroke:#28a745,color:#000
+    style D2 fill:#d4edda,stroke:#28a745,color:#000
 ```
 
-**Output table:** `RAW_FIVETRAN_CONNECTIONS`
+The actual SQL filter clause:
 
-| Column | Type | Content |
-|---|---|---|
-| `DATA` | VARIANT | `{"items": [{connection1}, {connection2}, ...]}` |
-
----
-
-### Step 4: Run Flatten and Filter
-
-| Property | Value |
-|---|---|
-| **Component** | [Run Transformation](https://docs.matillion.com/data-productivity-cloud/designer/docs/run-transformation) |
-| **Type** | `run-transformation` |
-| **Target Pipeline** | `Flatten_and_Filter_Broken_TLS.tran.yaml` |
-| **Transition** | Success → `Insert Staging into Log` |
-
-**What happens:**  
-This triggers the transformation pipeline (detailed in Section 5) which:
-- Reads `RAW_FIVETRAN_CONNECTIONS`
-- Flattens the JSON array
-- Filters for TLS/SSL/certificate errors only
-- Adds `CHECK_DATE` and `WATERMARK_DATE`
-- Writes results to `FIVETRAN_TLS_BROKEN_STAGING`
-
----
-
-### Step 5: Insert Staging into Log
-
-| Property | Value |
-|---|---|
-| **Component** | [SQL Script](https://docs.matillion.com/data-productivity-cloud/designer/docs/sql-executor) |
-| **Type** | `sql-executor` |
-| **Transition** | Success → `Loop Today's Broken IDs` |
-
-**SQL executed:**
 ```sql
-INSERT INTO "FIVETRAN_TLS_BROKEN_LOG" (
-  "CHECK_DATE", "WATERMARK_DATE", "BROKEN_ID", "CONNECTOR_NAME",
-  "SERVICE", "ERROR_REASON", "VALIDATED", "VALIDATION_RESULT"
-)
-SELECT
-  "CHECK_DATE", "WATERMARK_DATE", "BROKEN_ID", "CONNECTOR_NAME",
-  "SERVICE", "ERROR_REASON", "VALIDATED", NULL
-FROM "FIVETRAN_TLS_BROKEN_STAGING"
-WHERE "BROKEN_ID" NOT IN (
-  SELECT "BROKEN_ID" FROM "FIVETRAN_TLS_BROKEN_LOG"
-  WHERE "CHECK_DATE" = CURRENT_DATE()
-);
-```
-
-**Why this step exists (instead of writing directly to the log table from the transformation):**
-
-1. **Deduplication** — If the pipeline is re-run on the same day (e.g., after a failure), this `NOT IN` subquery prevents duplicate entries for the same `BROKEN_ID` on the same `CHECK_DATE`.
-2. **Separation of concerns** — The transformation writes to a staging table; the orchestration controls when and how data enters the permanent log.
-3. **Idempotency** — Re-running the pipeline on the same day won't create duplicate log entries.
-
----
-
-### Step 6: Loop Today's Broken IDs
-
-| Property | Value |
-|---|---|
-| **Component** | [Table Iterator](https://docs.matillion.com/data-productivity-cloud/designer/docs/table-iterator) |
-| **Type** | `table-iterator` |
-| **Mode** | Advanced |
-| **Concurrency** | Sequential |
-| **Break on Failure** | No |
-| **Iteration Target** | `Validate Each Connection` |
-| **Transition** | Success → `Send Summary Notification` |
-
-**Iterator query:**
-```sql
-SELECT "BROKEN_ID", "CONNECTOR_NAME", "SERVICE"
-FROM "FIVETRAN_TLS_BROKEN_LOG"
-WHERE "CHECK_DATE" = CURRENT_DATE()
-  AND "VALIDATED" = FALSE
-ORDER BY "BROKEN_ID"
-```
-
-**Column mapping (per iteration):**
-
-| Table Column | → Pipeline Variable |
-|---|---|
-| `BROKEN_ID` | `broken_id` |
-| `CONNECTOR_NAME` | `connector_name` |
-| `SERVICE` | `service` |
-
-**Key design decisions:**
-- **Sequential** execution prevents Fivetran API rate-limiting.
-- **Break on Failure = No** ensures all broken IDs are attempted even if some fail.
-- **Advanced mode** with a custom SQL query allows the precise `WHERE` clause filtering.
-
-See [Section 9: Loop Logic](#9-loop-logic--detailed-explanation) for full details.
-
----
-
-### Step 7: Validate Each Connection (Iterator Target)
-
-| Property | Value |
-|---|---|
-| **Component** | [Run Orchestration](https://docs.matillion.com/data-productivity-cloud/designer/docs/run-orchestration) |
-| **Type** | `run-orchestration` |
-| **Target Pipeline** | `Validate_TLS_Connection.orch.yaml` |
-| **Position** | Same coordinates as the iterator (stacked) |
-
-**Variable pass-through:**
-
-| Child Variable | Value from Parent |
-|---|---|
-| `broken_id` | `${broken_id}` |
-| `connector_name` | `${connector_name}` |
-| `service` | `${service}` |
-| `fivetran_api_key` | `${fivetran_api_key}` |
-| `fivetran_api_secret` | `${fivetran_api_secret}` |
-
-**Why a sub-pipeline?**  
-The Table Iterator can only target **one** component. Since we need to both call the API AND update the log, we wrap both steps in a sub-orchestration pipeline.
-
----
-
-### Step 8: Send Summary Notification
-
-| Property | Value |
-|---|---|
-| **Component** | [SQL Script](https://docs.matillion.com/data-productivity-cloud/designer/docs/sql-executor) |
-| **Type** | `sql-executor` |
-
-**SQL executed:**
-```sql
-CREATE OR REPLACE TEMPORARY TABLE FIVETRAN_TLS_DAILY_SUMMARY AS
-SELECT
-  CURRENT_DATE() AS REPORT_DATE,
-  COUNT(*) AS TOTAL_BROKEN_TODAY,
-  SUM(CASE WHEN "VALIDATED" = TRUE THEN 1 ELSE 0 END) AS VALIDATED_TODAY,
-  SUM(CASE WHEN "VALIDATED" = FALSE THEN 1 ELSE 0 END) AS NOT_VALIDATED
-FROM "FIVETRAN_TLS_BROKEN_LOG"
-WHERE "CHECK_DATE" = CURRENT_DATE();
-```
-
-**Transition:** Success → `Send Slack Notification`
-
----
-
-### Step 9: Send Slack Notification
-
-| Property | Value |
-|---|---|
-| **Component** | [Python Pushdown](https://docs.matillion.com/data-productivity-cloud/designer/docs/python-pushdown) |
-| **Type** | `python-pushdown` |
-| **External Access Integration** | `FIVETRAN_API_ACCESS` |
-| **Packages** | `requests` |
-| **Variable Resolution** | Enabled (`Yes`) |
-| **Script Timeout** | 120 seconds |
-| **Transition** | Success → `Send Email Notification` |
-
-**What the script does:**
-
-1. Reads `${slack_webhook_url}` from pipeline variable.
-2. Queries `FIVETRAN_TLS_DAILY_SUMMARY` for today's counts.
-3. If no webhook URL is configured, gracefully skips (prints "Skipping").
-4. Builds a rich Slack Block Kit message with:
-   - **Header**: "🔒 Fivetran TLS Fix Report - {date}"
-   - **Fields**: Total Broken, Validated/Fixed, Not Validated, Success Rate %
-   - **Footer**: "Automated by Matillion"
-5. POSTs the JSON payload to the Slack incoming webhook URL.
-6. Logs the result (success or failure with HTTP status).
-
-**Slack message preview:**
-```
-┌─────────────────────────────────────────┐
-│ 🔒 Fivetran TLS Fix Report - 2026-03-27│
-│                                         │
-│ Total TLS Broken:    12                 │
-│ Validated/Fixed:     10                 │
-│ Not Validated:        2                 │
-│ Success Rate:       83.3%               │
-│                                         │
-│ Automated by Matillion                  │
-└─────────────────────────────────────────┘
-```
-
-**Graceful degradation:** If `slack_webhook_url` is empty or not set, the component prints a skip message and succeeds — it does NOT fail the pipeline.
-
----
-
-### Step 10: Send Email Notification
-
-| Property | Value |
-|---|---|
-| **Component** | [Python Pushdown](https://docs.matillion.com/data-productivity-cloud/designer/docs/python-pushdown) |
-| **Type** | `python-pushdown` |
-| **Variable Resolution** | Enabled (`Yes`) |
-| **Script Timeout** | 120 seconds |
-| **Transition** | _(end of pipeline)_ |
-
-**What the script does:**
-
-1. Reads `${notification_email}` from pipeline variable.
-2. Queries `FIVETRAN_TLS_DAILY_SUMMARY` for today's counts.
-3. If no email is configured, gracefully skips.
-4. Builds a plain-text email with subject and body:
-   - **Subject**: `Fivetran TLS Fix Report - 2026-03-27: 12 broken, 10 fixed`
-   - **Body**: Formatted report with all counts and success rate
-5. Calls Snowflake's `SYSTEM$SEND_EMAIL()` stored procedure using the `tls_fix_email_integration` integration.
-6. Catches exceptions gracefully — if the email integration isn't configured, it logs the error but still prints the summary.
-
-**Email body preview:**
-```
-Fivetran TLS Fix Daily Report
-================================
-Date:             2026-03-27
-Total TLS Broken: 12
-Validated/Fixed:  10
-Not Validated:    2
-Success Rate:     83.3%
-================================
-Automated by Matillion - Daily_Fivetran_TLS_Fix pipeline
-Check FIVETRAN_TLS_BROKEN_LOG for full details.
-```
-
-**Graceful degradation:** If `notification_email` is empty or the Snowflake email integration isn't configured, the component catches the error, prints the summary to the task log, and succeeds.
-
----
-
-## 5. Transformation Pipeline: Flatten_and_Filter_Broken_TLS
-
-**File:** `Flatten_and_Filter_Broken_TLS.tran.yaml`  
-**Type:** Transformation  
-**Purpose:** Flatten raw JSON, extract connection fields, filter for TLS errors, add watermark columns
-
-### Step-by-Step Component Breakdown
-
----
-
-### Step T1: Load Raw Connections
-
-| Property | Value |
-|---|---|
-| **Component** | [Table Input](https://docs.matillion.com/data-productivity-cloud/designer/docs/table-input) |
-| **Type** | `table-input` |
-| **Table** | `RAW_FIVETRAN_CONNECTIONS` |
-| **Columns** | `DATA` |
-| **Output** | → `Flatten Connection Items` |
-
-**What it reads:**  
-The single-row, single-column VARIANT table containing the complete Fivetran API response.
-
-**Sample input:**
-```json
-{
-  "items": [
-    {
-      "id": "abc_123",
-      "name": "My Postgres Connector",
-      "service": "postgres",
-      "setup_state": "broken",
-      "status": {
-        "setup_state": "broken",
-        "error": "TLS certificate validation failed..."
-      },
-      "setup_tests": [...]
-    },
-    ...
-  ]
-}
-```
-
----
-
-### Step T2: Flatten Connection Items
-
-| Property | Value |
-|---|---|
-| **Component** | [Flatten Variant](https://docs.matillion.com/data-productivity-cloud/designer/docs/flatten-variant) |
-| **Type** | `flatten-variant` |
-| **Include Input Columns** | No |
-| **Input** | ← `Load Raw Connections` |
-| **Output** | → `Filter TLS Broken Only` |
-
-**Column Flattens (array explosion):**
-
-| Column | Property | Alias | Outer | Recursive | Mode |
-|---|---|---|---|---|---|
-| `DATA` | `items` | `items_flat` | Yes | No | Array |
-
-This explodes the `items` array so each connection becomes its own row.
-
-**Column Mapping (field extraction):**
-
-| Source Column | Property | Type | Output Alias |
-|---|---|---|---|
-| `items_flat` | `id` | VARCHAR | `BROKEN_ID` |
-| `items_flat` | `name` | VARCHAR | `CONNECTOR_NAME` |
-| `items_flat` | `service` | VARCHAR | `SERVICE` |
-| `items_flat` | `setup_state` | VARCHAR | `SETUP_STATE` |
-| `items_flat` | `status.setup_state` | VARCHAR | `STATUS_SETUP_STATE` |
-| `items_flat` | `setup_tests` | VARIANT | `SETUP_TESTS` |
-| `items_flat` | `status` | VARIANT | `ERROR_REASON` |
-
-**Output:** One row per Fivetran connection with extracted fields.
-
----
-
-### Step T3: Filter TLS Broken Only
-
-| Property | Value |
-|---|---|
-| **Component** | [Filter](https://docs.matillion.com/data-productivity-cloud/designer/docs/filter) |
-| **Type** | `filter` |
-| **Mode** | Advanced |
-| **Input** | ← `Flatten Connection Items` |
-| **Output** | → `Add Watermark Columns` |
-
-**Filter clause (Advanced SQL WHERE):**
-```sql
-("SETUP_STATE" = 'broken' OR "STATUS_SETUP_STATE" = 'broken')
+("CONNECTOR_SETUP_STATE" = 'broken' OR "STATUS_SETUP_STATE" = 'broken')
 AND (
-  LOWER("ERROR_REASON"::VARCHAR) LIKE '%tls%'
-  OR LOWER("ERROR_REASON"::VARCHAR) LIKE '%certificate%'
-  OR LOWER("ERROR_REASON"::VARCHAR) LIKE '%ssl%'
+  LOWER("ERROR_REASON") LIKE '%tls%'
+  OR LOWER("ERROR_REASON") LIKE '%certificate%'
+  OR LOWER("ERROR_REASON") LIKE '%ssl%'
+  OR LOWER("STATUS_TASKS"::VARCHAR) LIKE '%tls%'
+  OR LOWER("STATUS_TASKS"::VARCHAR) LIKE '%certificate%'
+  OR LOWER("STATUS_WARNINGS"::VARCHAR) LIKE '%tls%'
+  OR LOWER("STATUS_WARNINGS"::VARCHAR) LIKE '%certificate%'
   OR LOWER("SETUP_TESTS"::VARCHAR) LIKE '%tls%'
   OR LOWER("SETUP_TESTS"::VARCHAR) LIKE '%certificate%'
+  OR LOWER("SETUP_TESTS"::VARCHAR) LIKE '%ssl%'
 )
 ```
 
-See [Section 8: Filter Logic](#8-filter-logic--detailed-explanation) for detailed explanation.
+**Result: 2 rows.** Only `relief_harden` and `warm_feather` pass. `bright_storm` correctly excluded (OAuth issue, not TLS).
+
+| BROKEN_ID | CONNECTOR_SERVICE | CONNECTOR_SETUP_STATE | ERROR_REASON | STATUS_TASKS | SETUP_TESTS |
+|---|---|---|---|---|---|
+| relief_harden | mysql_rds | broken | {...} | `[{..."TLS certificate validation failed"...}]` | `[{..."SSL certificate verify failed"...}]` |
+| warm_feather | sql_server_rds | broken | {...} | `[{..."SSL/TLS handshake failed"...}]` | `[{..."TLS handshake error"...}]` |
+
+### Step 5: Add Watermark Columns → Calculator adds timestamps
+
+| BROKEN_ID | CONNECTOR_SERVICE | ... | **CHECK_DATE** | **WATERMARK_DATE** | **VALIDATION_STATUS** |
+|---|---|---|---|---|---|
+| relief_harden | mysql_rds | ... | 2026-03-27 | 2026-03-27 03:01:45.123 | pending |
+| warm_feather | sql_server_rds | ... | 2026-03-27 | 2026-03-27 03:01:45.123 | pending |
+
+**Still 2 rows.** Three new columns added: today's date, exact timestamp, initial status.
+
+### Step 6: Write to Staging → `FIVETRAN_TLS_BROKEN_STAGING`
+
+The Rewrite Table component creates/replaces the staging table with the 2 filtered rows.
+
+### Step 7: MERGE Into Log → `FIVETRAN_TLS_BROKEN_LOG`
+
+Back in the orchestration, the MERGE ensures idempotency:
+
+```sql
+MERGE INTO FIVETRAN_TLS_BROKEN_LOG AS tgt
+USING FIVETRAN_TLS_BROKEN_STAGING AS src
+ON tgt.BROKEN_ID = src.BROKEN_ID AND tgt.CHECK_DATE = src.CHECK_DATE
+WHEN NOT MATCHED THEN INSERT (...) VALUES (...);
+```
+
+If the pipeline runs twice on the same day, duplicates are **not** inserted (matched on BROKEN_ID + CHECK_DATE).
+
+**Log table after MERGE on March 27:**
+
+| BROKEN_ID | CONNECTOR_SERVICE | CHECK_DATE | WATERMARK_DATE | VALIDATION_STATUS | VALIDATION_MESSAGE | VALIDATED_AT |
+|---|---|---|---|---|---|---|
+| relief_harden | mysql_rds | 2026-03-27 | 2026-03-27 03:01:45 | pending | NULL | NULL |
+| warm_feather | sql_server_rds | 2026-03-27 | 2026-03-27 03:01:45 | pending | NULL | NULL |
+
+### Step 8: Iterate Broken IDs → Table Iterator loops staging rows
+
+```mermaid
+flowchart LR
+    subgraph ITER ["Table Iterator reads FIVETRAN_TLS_BROKEN_STAGING"]
+        direction TB
+        R1["Row 1: relief_harden"]
+        R2["Row 2: warm_feather"]
+    end
+
+    R1 -- "Sets variables:<br>broken_connector_id = 'relief_harden'<br>broken_connector_name = 'mysql_rds'" --> V1["Run Orchestration<br>Validate_TLS_Connection.orch.yaml"]
+
+    R2 -- "Sets variables:<br>broken_connector_id = 'warm_feather'<br>broken_connector_name = 'sql_server_rds'" --> V2["Run Orchestration<br>Validate_TLS_Connection.orch.yaml"]
+
+    V1 --> DONE["Iterator complete<br>→ Count Results"]
+    V2 --> DONE
+```
+
+**Iteration 1:** Variable `broken_connector_id` = `relief_harden`  
+**Iteration 2:** Variable `broken_connector_id` = `warm_feather`
+
+### Step 9: Validate Connection → Sub-Pipeline per connector
+
+For each iteration, the sub-pipeline:
+
+1. **Webhook POST** to `https://api.fivetran.com/v1/connectors/relief_harden/test`
+   - Payload: `{"trust_certificates": true, "trust_fingerprints": true}`
+2. **On Success** → SQL UPDATE sets `VALIDATION_STATUS = 'success'`
+3. **On Failure** → SQL UPDATE sets `VALIDATION_STATUS = 'failed'`
+
+**Log table after validation (example: relief_harden succeeds, warm_feather fails):**
+
+| BROKEN_ID | CHECK_DATE | VALIDATION_STATUS | VALIDATION_MESSAGE | VALIDATED_AT |
+|---|---|---|---|---|
+| relief_harden | 2026-03-27 | **success** | Connection test passed with trust_certificates=true | 2026-03-27 03:02:10 |
+| warm_feather | 2026-03-27 | **failed** | Connection test failed - manual review required | 2026-03-27 03:02:15 |
+
+### Step 10: Count Results → SQL SETs pipeline variables
+
+```sql
+SET total_broken = 2;   -- COUNT(*) WHERE CHECK_DATE = today
+SET total_fixed = 1;    -- WHERE VALIDATION_STATUS = 'success'
+SET total_failed = 1;   -- WHERE VALIDATION_STATUS = 'failed'
+SET total_pending = 0;  -- WHERE VALIDATION_STATUS = 'pending'
+SET check_date = '2026-03-27';
+```
+
+### Step 11: Triple Notification
+
+**Slack (Webhook Post):**
+```json
+{"text": ":wrench: *Daily Fivetran TLS Fix Report*\nDate: 2026-03-27\nTotal broken: 2\nFixed: 1\nStill failing: 1\nPending: 0"}
+```
+
+**Email (Send Email v2):**
+```
+Subject: Daily Fivetran TLS Fix Report - 2026-03-27
+
+Total TLS-broken connectors: 2
+Fixed (trust_certificates=true): 1
+Still failing: 1
+Pending: 0
+
+Check FIVETRAN_TLS_BROKEN_LOG for details.
+```
+
+**AWS SNS Message:**
+```
+Broken: 2 | Fixed: 1 | Failed: 1 | Pending: 0
+```
+
+### Step 12: Cleanup → DROP staging tables
+
+```sql
+DROP TABLE IF EXISTS RAW_FIVETRAN_CONNECTIONS;
+DROP TABLE IF EXISTS FIVETRAN_TLS_BROKEN_STAGING;
+```
 
 ---
 
-### Step T4: Add Watermark Columns
+## 4. Pipeline 1: Main Orchestration
 
-| Property | Value |
-|---|---|
-| **Component** | [Calculator](https://docs.matillion.com/data-productivity-cloud/designer/docs/calculator) |
-| **Type** | `calculator` |
-| **Include Input Columns** | Yes |
-| **Input** | ← `Filter TLS Broken Only` |
-| **Output** | → `Append to Log Table` |
+**File:** `fivetran_tls_daily_fix.orch.yaml`  
+**Components:** 12 | **Variables:** 13
 
-**Calculations:**
+### Visual Flow
 
-| Expression | Output Column | Purpose |
-|---|---|---|
-| `CURRENT_DATE()` | `CHECK_DATE` | Today's date — used as daily partition key |
-| `CURRENT_TIMESTAMP()` | `WATERMARK_DATE` | Exact timestamp — distinguishes runs within a day |
-| `FALSE` | `VALIDATED` | Default — marks as not yet validated |
+```mermaid
+flowchart LR
+    A(["▶ Start"]) --> B["🏗 Init Log Table<br><code>create-table-v2</code><br>Create If Not Exists"]
+    B --> C["🔌 Fetch All<br>Connections<br><code>Custom Connector</code>"]
+    C --> D["🔀 Transform<br>& Filter<br><code>run-transformation</code>"]
+    D --> E["🔄 Merge Into<br>Log<br><code>sql-executor</code>"]
+    E --> F["🔁 Iterate<br>Broken IDs<br><code>table-iterator</code>"]
+    F --> G["📊 Count<br>Results<br><code>sql-executor</code>"]
+    G --> H["💬 Notify<br>Slack<br><code>webhook-post</code>"]
+    H --> I["📧 Send Email<br>Report<br><code>send-email-v2</code>"]
+    I --> J["📢 SNS<br>Alert<br><code>sns-message</code>"]
+    J --> K["🧹 Cleanup<br>Staging<br><code>sql-executor</code>"]
 
-See [Section 7: Watermark Logic](#7-watermark-logic--detailed-explanation) for detailed explanation.
+    F -. "each row" .-> L["✅ Validate<br>Connection<br><code>run-orchestration</code>"]
+
+    style C fill:#fff3cd,stroke:#ffc107,color:#000
+    style H fill:#d4edda,stroke:#28a745,color:#000
+    style I fill:#d4edda,stroke:#28a745,color:#000
+    style J fill:#d4edda,stroke:#28a745,color:#000
+```
+
+### Transition Map
+
+| From | → | To | Condition |
+|---|---|---|---|
+| Start | unconditional | Init Log Table | Always |
+| Init Log Table | success | Fetch All Connections | Table created/exists |
+| Fetch All Connections | success | Transform and Filter | Data loaded |
+| Transform and Filter | success | Merge Into Log | Transform complete |
+| Merge Into Log | success | Iterate Broken IDs | Merge complete |
+| Iterate Broken IDs | success | Count Results | All iterations done |
+| Iterate Broken IDs | iteration | Validate Connection | Per row (iterator target) |
+| Count Results | success | Notify Slack | Variables set |
+| Notify Slack | unconditional | Send Email Report | Always (even if Slack fails) |
+| Send Email Report | unconditional | SNS Alert | Always |
+| SNS Alert | success | Cleanup Staging | Alert sent |
 
 ---
 
-### Step T5: Append to Log Table (Staging)
+## 5. Pipeline 2: Transformation
 
-| Property | Value |
-|---|---|
-| **Component** | [Rewrite Table](https://docs.matillion.com/data-productivity-cloud/designer/docs/rewrite-table) |
-| **Type** | `rewrite-table` |
-| **Target Table** | `FIVETRAN_TLS_BROKEN_STAGING` |
-| **Input** | ← `Add Watermark Columns` |
+**File:** `fivetran_tls_transform.tran.yaml`  
+**Components:** 6 | **Variables:** None (inherits orchestration context)
 
-**Why Rewrite Table (not Table Output)?**  
-We write to a **staging table** (not the final log) because:
-1. The staging table is recreated fresh each run.
-2. The orchestration pipeline then handles the dedup INSERT into the permanent log.
-3. This avoids the need for the log table to already exist when the transformation validates.
+### Visual Flow
+
+```mermaid
+flowchart LR
+    A["📥 Load Raw<br>Connections<br><code>table-input</code>"] --> B["📦 Extract Status<br>Fields<br><code>extract-nested-data-sf</code>"]
+    B --> C["🏷 Rename Connector<br>Fields<br><code>calculator</code>"]
+    C --> D["🔍 Filter TLS<br>Broken Only<br><code>filter</code>"]
+    D --> E["🕐 Add Watermark<br>Columns<br><code>calculator</code>"]
+    E --> F["💾 Write to<br>Staging<br><code>rewrite-table</code>"]
+
+    style B fill:#e8f4fd,stroke:#0d6efd,color:#000
+    style D fill:#fff3cd,stroke:#ffc107,color:#000
+```
+
+### Extract Nested Data — Field Mapping
+
+| JSON Path | Source Column | Output Alias | Type | Included |
+|---|---|---|---|---|
+| `status.setup_state` | status | STATUS_SETUP_STATE | VARCHAR(256) | ✅ Yes |
+| `status.tasks` | status | STATUS_TASKS | VARIANT | ✅ Yes |
+| `status.warnings` | status | STATUS_WARNINGS | VARIANT | ✅ Yes |
+| `status.setup_tests` | status | SETUP_TESTS | VARIANT | ✅ Yes |
+| `status.is_historical_sync` | status | IS_HISTORICAL_SYNC | BOOLEAN | ❌ No |
 
 ---
 
-## 6. Sub-Orchestration Pipeline: Validate_TLS_Connection
+## 6. Pipeline 3: Validation Sub-Orchestration
 
 **File:** `Validate_TLS_Connection.orch.yaml`  
-**Type:** Orchestration  
-**Purpose:** Called once per broken connection — tests it and logs the result
+**Components:** 4 | **Variables:** 2 (PUBLIC, passed from parent)
 
-### Step S1: Start
+### Visual Flow
 
-Standard entry point. Transitions unconditionally to the API call.
+```mermaid
+flowchart LR
+    S(["▶ Start"]) --> T["🔐 Test Connection<br><code>webhook-post</code><br>POST trust_certificates=true"]
+    T -- "✅ HTTP 2xx" --> F["✅ Mark as Fixed<br><code>sql-executor</code><br>SET status='success'"]
+    T -- "❌ HTTP 4xx/5xx" --> X["❌ Mark as Failed<br><code>sql-executor</code><br>SET status='failed'"]
 
-### Step S2: Call Fivetran Test API
-
-| Property | Value |
-|---|---|
-| **Component** | [Python Pushdown](https://docs.matillion.com/data-productivity-cloud/designer/docs/python-pushdown) |
-| **Type** | `python-pushdown` |
-| **External Access Integration** | `FIVETRAN_API_ACCESS` |
-| **Packages** | `requests` |
-| **Script Timeout** | 120 seconds |
-
-**What the script does:**
-
-1. Reads `${broken_id}`, `${fivetran_api_key}`, `${fivetran_api_secret}` from variables.
-2. Calls `POST https://api.fivetran.com/v1/connections/{broken_id}/test` with body `{"trust_certificates": true}`.
-3. Uses Basic Auth with the API key and secret.
-4. On success: stores the JSON response in `${validation_result}` variable.
-5. On exception: stores the error message as JSON in `${validation_result}`.
-6. Updates `${api_status_code}` with the HTTP status code.
-
-**Transitions:**
-- Success → `Update Log with Result`
-- Failure → `Log Failure`
-
-### Step S3a: Update Log with Result (Success Path)
-
-| Property | Value |
-|---|---|
-| **Component** | [SQL Script](https://docs.matillion.com/data-productivity-cloud/designer/docs/sql-executor) |
-
-**SQL:**
-```sql
-UPDATE "FIVETRAN_TLS_BROKEN_LOG"
-SET "VALIDATED" = TRUE,
-    "VALIDATION_RESULT" = PARSE_JSON('${validation_result}')
-WHERE "BROKEN_ID" = '${broken_id}'
-  AND "CHECK_DATE" = CURRENT_DATE();
+    style F fill:#d4edda,stroke:#28a745,color:#000
+    style X fill:#f8d7da,stroke:#dc3545,color:#000
 ```
 
-### Step S3b: Log Failure (Failure Path)
+### Webhook POST Details
 
-| Property | Value |
-|---|---|
-| **Component** | [SQL Script](https://docs.matillion.com/data-productivity-cloud/designer/docs/sql-executor) |
-
-**SQL:**
-```sql
-UPDATE "FIVETRAN_TLS_BROKEN_LOG"
-SET "VALIDATED" = TRUE,
-    "VALIDATION_RESULT" = PARSE_JSON('{"error": "API call failed for connection ${broken_id}"}')
-WHERE "BROKEN_ID" = '${broken_id}'
-  AND "CHECK_DATE" = CURRENT_DATE();
-```
-
-**Why mark VALIDATED=TRUE even on failure?**  
-To prevent infinite retry loops. If the API call fails, we still mark it as validated (attempted) and store the error. The `VALIDATION_RESULT` JSON will contain the error details for investigation.
+- **URL:** `https://api.fivetran.com/v1/connectors/${broken_connector_id}/test`
+- **Payload:** `{"trust_certificates": true, "trust_fingerprints": true}`
+- **Variable resolution:** `${broken_connector_id}` is replaced at runtime by the iterator
 
 ---
 
-## 7. Watermark Logic — Detailed Explanation
+## 7. How Each Component Works Internally
 
-### The Problem
+### Custom Connector (Fetch All Connections)
 
-We need to:
-1. Keep a **full history** of all broken connections across all days.
-2. Each day, only validate **that day's newly discovered broken IDs**.
-3. If a connection is broken today AND was also broken yesterday, it should still appear as a new entry for today (it may have been re-broken after being fixed).
+```mermaid
+sequenceDiagram
+    participant M as Matillion
+    participant F as Fivetran API
+    participant S as Snowflake
 
-### The Solution: Dual-Column Watermark
+    M->>F: GET /v1/connectors?limit=1000
+    F-->>M: {code, data: {items: [...], next_cursor: "abc"}}
+    M->>S: INSERT INTO RAW_FIVETRAN_CONNECTIONS (page 1 rows)
 
-| Column | Type | Purpose | Example |
-|---|---|---|---|
-| `CHECK_DATE` | DATE | **Daily partition key** — groups entries by calendar date | `2026-03-27` |
-| `WATERMARK_DATE` | TIMESTAMP_NTZ | **Exact detection time** — unique per pipeline run | `2026-03-27 09:30:15.123` |
+    M->>F: GET /v1/connectors?limit=1000&cursor=abc
+    F-->>M: {code, data: {items: [...], next_cursor: null}}
+    M->>S: INSERT INTO RAW_FIVETRAN_CONNECTIONS (page 2 rows)
 
-### How It Works
-
-```
-Day 1 (March 27):
-  Pipeline runs at 3:00 AM IST
-  → CHECK_DATE = 2026-03-27
-  → WATERMARK_DATE = 2026-03-27 03:00:05.XXX
-  → Finds connections A, B, C broken
-  → Inserts 3 rows with VALIDATED=FALSE
-  → Iterator selects WHERE CHECK_DATE='2026-03-27' AND VALIDATED=FALSE
-  → Validates A, B, C → sets VALIDATED=TRUE for each
-
-Day 2 (March 28):
-  Pipeline runs at 3:00 AM IST
-  → CHECK_DATE = 2026-03-28
-  → WATERMARK_DATE = 2026-03-28 03:00:05.XXX
-  → Finds connections A, D broken (B and C were fixed)
-  → Inserts 2 rows (A is a NEW entry for today, not a duplicate of yesterday)
-  → Iterator selects WHERE CHECK_DATE='2026-03-28' AND VALIDATED=FALSE
-  → Validates A, D → only today's entries
-  → Yesterday's entries (A, B, C from March 27) are untouched
+    Note over M,S: Pagination complete (next_cursor = null)
 ```
 
-### Why Both Columns?
+The Custom Connector handles cursor-based pagination automatically. Each page's `items[]` array is flattened into rows and inserted into the target table. No coding required.
 
-- **CHECK_DATE alone** would suffice for daily partitioning, but wouldn't distinguish between multiple runs on the same day.
-- **WATERMARK_DATE alone** would make it hard to query "all broken IDs from today" without timestamp range logic.
-- **Together**, they provide both **easy daily querying** (`WHERE CHECK_DATE = CURRENT_DATE()`) and **exact lineage** (which specific run detected this issue).
+### Extract Nested Data (Unpack JSON)
 
-### Deduplication Guard
+```mermaid
+sequenceDiagram
+    participant IN as Input Row
+    participant END as Extract Nested Data
+    participant OUT as Output Row
 
-The `Insert Staging into Log` SQL Script prevents duplicates within the same day:
-
-```sql
-WHERE "BROKEN_ID" NOT IN (
-  SELECT "BROKEN_ID" FROM "FIVETRAN_TLS_BROKEN_LOG"
-  WHERE "CHECK_DATE" = CURRENT_DATE()
-)
+    IN->>END: Row with status VARIANT column<br>{"setup_state":"broken","tasks":[...],...}
+    END->>END: Read column mapping config
+    END->>END: For each mapped field:<br>• status.setup_state → STATUS_SETUP_STATE<br>• status.tasks → STATUS_TASKS<br>• status.warnings → STATUS_WARNINGS<br>• status.setup_tests → SETUP_TESTS
+    END->>END: Apply casting method<br>(replace unparseable with null)
+    END->>OUT: Original columns + 4 new extracted columns
 ```
 
-This means:
-- If the pipeline is re-run on the same day (after a failure), already-inserted IDs are skipped.
-- Each `BROKEN_ID` can appear at most **once per day** in the log.
+### Table Iterator (Loop Mechanism)
+
+```mermaid
+sequenceDiagram
+    participant IT as Table Iterator
+    participant TBL as STAGING Table
+    participant VAR as Pipeline Variables
+    participant TGT as Run Orchestration<br>(Validate Connection)
+
+    IT->>TBL: SELECT BROKEN_ID, CONNECTOR_SERVICE<br>FROM FIVETRAN_TLS_BROKEN_STAGING<br>ORDER BY BROKEN_ID ASC
+    TBL-->>IT: Row 1: relief_harden, mysql_rds<br>Row 2: warm_feather, sql_server_rds
+
+    Note over IT: Iteration 1
+    IT->>VAR: SET broken_connector_id = 'relief_harden'<br>SET broken_connector_name = 'mysql_rds'
+    IT->>TGT: Execute sub-pipeline
+    TGT-->>IT: Complete (success or failure)
+
+    Note over IT: Iteration 2
+    IT->>VAR: SET broken_connector_id = 'warm_feather'<br>SET broken_connector_name = 'sql_server_rds'
+    IT->>TGT: Execute sub-pipeline
+    TGT-->>IT: Complete
+
+    Note over IT: All iterations done → follow success transition
+```
+
+### MERGE INTO (Deduplication)
+
+```mermaid
+sequenceDiagram
+    participant STG as Staging (Today's data)
+    participant LOG as Log Table (Historical)
+    participant MERGE as MERGE INTO
+
+    STG->>MERGE: Row: relief_harden + 2026-03-27
+    MERGE->>LOG: Check: EXISTS WHERE BROKEN_ID='relief_harden' AND CHECK_DATE='2026-03-27'?
+    LOG-->>MERGE: No match
+    MERGE->>LOG: INSERT new row
+
+    Note over MERGE: If pipeline re-runs same day...
+    STG->>MERGE: Row: relief_harden + 2026-03-27
+    MERGE->>LOG: Check: EXISTS?
+    LOG-->>MERGE: Already exists!
+    MERGE->>LOG: SKIP (no duplicate)
+```
 
 ---
 
-## 8. Filter Logic — Detailed Explanation
+## 8. Log Table Schema & Partitioning Strategy
 
-### What We're Filtering For
+### `FIVETRAN_TLS_BROKEN_LOG` — Column Reference
 
-Fivetran connections where:
-1. The connection's setup state is **broken** (either in the top-level `setup_state` field OR the nested `status.setup_state` field — Fivetran's API returns both).
-2. The error message or setup test results contain keywords indicating a **TLS/SSL/certificate** issue.
-
-### The Filter Expression (Advanced SQL WHERE)
-
-```sql
-("SETUP_STATE" = 'broken' OR "STATUS_SETUP_STATE" = 'broken')
-AND (
-  LOWER("ERROR_REASON"::VARCHAR) LIKE '%tls%'
-  OR LOWER("ERROR_REASON"::VARCHAR) LIKE '%certificate%'
-  OR LOWER("ERROR_REASON"::VARCHAR) LIKE '%ssl%'
-  OR LOWER("SETUP_TESTS"::VARCHAR) LIKE '%tls%'
-  OR LOWER("SETUP_TESTS"::VARCHAR) LIKE '%certificate%'
-)
-```
-
-### Breakdown
-
-| Clause | Purpose |
-|---|---|
-| `"SETUP_STATE" = 'broken'` | Catches connections where top-level setup_state is broken |
-| `"STATUS_SETUP_STATE" = 'broken'` | Catches connections where nested status.setup_state is broken |
-| `LOWER("ERROR_REASON"::VARCHAR) LIKE '%tls%'` | Matches TLS errors in the error/status JSON |
-| `LOWER("ERROR_REASON"::VARCHAR) LIKE '%certificate%'` | Matches certificate errors |
-| `LOWER("ERROR_REASON"::VARCHAR) LIKE '%ssl%'` | Matches SSL errors |
-| `LOWER("SETUP_TESTS"::VARCHAR) LIKE '%tls%'` | Matches TLS issues in setup test results |
-| `LOWER("SETUP_TESTS"::VARCHAR) LIKE '%certificate%'` | Matches certificate issues in setup tests |
-
-### Why VARIANT::VARCHAR Cast?
-
-The `ERROR_REASON` and `SETUP_TESTS` columns are VARIANT type (raw JSON). Casting to VARCHAR with `::VARCHAR` converts the entire JSON structure to a searchable string. Using `LOWER()` ensures case-insensitive matching.
-
-### Why Check Both `ERROR_REASON` and `SETUP_TESTS`?
-
-Fivetran reports errors in different places depending on the connection type:
-- Some connectors report in `status.error` (captured in our `ERROR_REASON` column)
-- Some connectors report in `setup_tests` array (captured in our `SETUP_TESTS` column)
-
-Checking both ensures we catch TLS issues regardless of where Fivetran reports them.
-
----
-
-## 9. Loop Logic — Detailed Explanation
-
-### The Iterator Pattern
-
-```
-┌──────────────────────────┐
-│   Table Iterator          │
-│   (Loop Today's Broken)   │
-│                            │
-│   Query:                   │
-│   SELECT BROKEN_ID,        │
-│     CONNECTOR_NAME, SERVICE │
-│   FROM FIVETRAN_TLS_..LOG  │
-│   WHERE CHECK_DATE = TODAY  │
-│     AND VALIDATED = FALSE   │
-│                            │
-│   For each row:            │
-│     broken_id = row[0]     │
-│     connector_name = row[1]│
-│     service = row[2]       │
-│                            │
-│   ┌────────────────────┐   │
-│   │  Run Orchestration │   │ ← Iterator Target (stacked)
-│   │  Validate_TLS_     │   │
-│   │  Connection.orch   │   │
-│   └────────────────────┘   │
-│                            │
-│   After all iterations:    │
-│   Success → Summary        │
-└──────────────────────────┘
-```
-
-### Why Table Iterator (Advanced Mode)?
-
-- **Advanced mode** allows a custom SQL query with `WHERE` clause, which is essential for filtering only today's unvalidated rows.
-- **Basic mode** would iterate ALL rows in the table (including historical), which is incorrect.
-
-### Why Run Orchestration as Target (Not Direct API Call)?
-
-The iterator can only target **ONE component**. Our validation logic requires:
-1. Call the Fivetran test API
-2. Update the log table with the result
-
-Two steps → must be wrapped in a sub-pipeline.
-
-### Concurrency: Sequential
-
-We iterate sequentially (not concurrently) because:
-1. **API rate limiting** — Fivetran may rate-limit concurrent requests.
-2. **Variable safety** — COPIED scope variables ensure each iteration gets its own values, but sequential is safer for database updates.
-3. **Debugging** — Sequential execution makes it easy to trace which connection caused issues.
-
-### Break on Failure: No
-
-Even if one connection fails to validate (API timeout, auth error, etc.), the iterator continues to the next one. This ensures maximum coverage per run.
-
-### After All Iterations
-
-Once the iterator has processed all rows (or the query returns 0 rows), it follows its `success` transition to the summary notification step.
-
----
-
-## 10. Complete Component Inventory & Connection Map
-
-### Pipeline 1: Daily_Fivetran_TLS_Fix.orch.yaml
-
-| # | Component Name | Type | Matillion Component | Connects To | Connection Type |
-|---|---|---|---|---|---|
-| 1 | Start | Entry point | `start` | Create Log Table | Unconditional |
-| 2 | Create Log Table | DDL | `create-table-v2` | Fetch Connections via API | Success |
-| 3 | Fetch Connections via API | API call | `python-pushdown` | Run Flatten and Filter | Success |
-| 4 | Run Flatten and Filter | Child pipeline | `run-transformation` | Insert Staging into Log | Success |
-| 5 | Insert Staging into Log | SQL | `sql-executor` | Loop Todays Broken IDs | Success |
-| 6 | Loop Todays Broken IDs | Iterator | `table-iterator` | Send Summary Notification | Success |
-| 7 | Validate Each Connection | Iterator target | `run-orchestration` | _(controlled by iterator)_ | Iteration |
-| 8 | Send Summary Notification | SQL | `sql-executor` | Send Slack Notification | Success |
-| 9 | Send Slack Notification | Slack alert | `python-pushdown` | Send Email Notification | Success |
-| 10 | Send Email Notification | Email alert | `python-pushdown` | _(end of pipeline)_ | — |
-
-### Pipeline 2: Flatten_and_Filter_Broken_TLS.tran.yaml
-
-| # | Component Name | Type | Matillion Component | Sources |
+| Column | Type | NOT NULL | Default | Description |
 |---|---|---|---|---|
-| 1 | Load Raw Connections | Data source | `table-input` | — |
-| 2 | Flatten Connection Items | JSON flatten | `flatten-variant` | Load Raw Connections |
-| 3 | Filter TLS Broken Only | Row filter | `filter` | Flatten Connection Items |
-| 4 | Add Watermark Columns | Calculated fields | `calculator` | Filter TLS Broken Only |
-| 5 | Append to Log Table | Write output | `rewrite-table` | Add Watermark Columns |
+| BROKEN_ID | VARCHAR(256) | ✅ | — | Fivetran connector ID (e.g. `relief_harden`) |
+| CONNECTOR_SERVICE | VARCHAR(256) | | — | Service type (e.g. `mysql_rds`, `postgres_rds`) |
+| CONNECTOR_SETUP_STATE | VARCHAR(64) | | — | Top-level `setup_state` from API |
+| STATUS_SETUP_STATE | VARCHAR(64) | | — | `status.setup_state` from nested object |
+| SETUP_TESTS | VARIANT | | — | Full `setup_tests` array as JSON |
+| ERROR_REASON | VARCHAR(4096) | | — | Full `status` object cast to string |
+| CHECK_DATE | DATE | ✅ | — | Daily partition key (`CURRENT_DATE()`) |
+| WATERMARK_DATE | TIMESTAMP | ✅ | — | Exact row creation time |
+| VALIDATION_STATUS | VARCHAR(64) | | `'pending'` | `pending` → `success` or `failed` |
+| VALIDATION_MESSAGE | VARCHAR(4096) | | — | API response detail |
+| VALIDATED_AT | TIMESTAMP | | — | When validation completed |
 
-### Pipeline 3: Validate_TLS_Connection.orch.yaml
+### How Daily Partitioning Works
 
-| # | Component Name | Type | Matillion Component | Connects To | Connection Type |
+```mermaid
+flowchart TB
+    subgraph DAY1 ["March 25"]
+        R1["relief_harden → pending → success"]
+        R2["warm_feather → pending → failed"]
+    end
+
+    subgraph DAY2 ["March 26"]
+        R3["warm_feather → pending → success"]
+        R4["cold_river → pending → failed"]
+    end
+
+    subgraph DAY3 ["March 27 (Today)"]
+        R5["relief_harden → pending → ?"]
+        R6["warm_feather → pending → ?"]
+    end
+
+    Q1["Today's broken IDs"] -- "WHERE CHECK_DATE = '2026-03-27'" --> DAY3
+    Q2["Historical trend"] -- "GROUP BY CHECK_DATE" --> DAY1 & DAY2 & DAY3
+    Q3["Recurring issues"] -- "GROUP BY BROKEN_ID<br>HAVING COUNT(*) > 3" --> DAY1 & DAY2 & DAY3
+
+    style DAY3 fill:#fff3cd,stroke:#ffc107,color:#000
+```
+
+> Same connector can appear on multiple days. Each day is independent. The iterator only processes **today's** rows from the staging table (which contains only today's filtered results).
+
+---
+
+## 9. Pipeline Variables Reference
+
+### Main Orchestration — 13 Variables
+
+| Variable | Type | Scope | Visibility | Set By | Used By |
 |---|---|---|---|---|---|
-| 1 | Start | Entry point | `start` | Call Fivetran Test API | Unconditional |
-| 2 | Call Fivetran Test API | API call | `python-pushdown` | Update Log with Result | Success |
-| 2b | Call Fivetran Test API | API call | `python-pushdown` | Log Failure | Failure |
-| 3a | Update Log with Result | SQL | `sql-executor` | _(end)_ | — |
-| 3b | Log Failure | SQL | `sql-executor` | _(end)_ | — |
+| `broken_connector_id` | TEXT | COPIED | PRIVATE | Table Iterator | Run Orchestration |
+| `broken_connector_name` | TEXT | COPIED | PRIVATE | Table Iterator | Run Orchestration |
+| `slack_webhook_url` | TEXT | SHARED | PUBLIC | User config | Webhook Post |
+| `email_recipient` | TEXT | SHARED | PUBLIC | User config | Send Email |
+| `email_sender` | TEXT | SHARED | PUBLIC | User config | Send Email |
+| `smtp_username` | TEXT | SHARED | PUBLIC | User config | Send Email |
+| `smtp_hostname` | TEXT | SHARED | PUBLIC | User config | Send Email |
+| `check_date` | TEXT | SHARED | PRIVATE | Count Results SQL | Slack, Email, SNS |
+| `total_broken` | NUMBER | SHARED | PRIVATE | Count Results SQL | Slack, Email, SNS |
+| `total_fixed` | NUMBER | SHARED | PRIVATE | Count Results SQL | Slack, Email, SNS |
+| `total_failed` | NUMBER | SHARED | PRIVATE | Count Results SQL | Slack, Email, SNS |
+| `total_pending` | NUMBER | SHARED | PRIVATE | Count Results SQL | Slack, Email, SNS |
 
-### Total Component Count: 18
+> **COPIED** scope for iterator variables — each iteration gets its own independent copy. **SHARED** for counters because they're set once after all iterations complete.
 
-| Component Type | Count | Used In |
+### Sub-Orchestration — 2 Variables
+
+| Variable | Type | Scope | Visibility | Set By |
+|---|---|---|---|---|
+| `broken_connector_id` | TEXT | COPIED | PUBLIC | Parent (setScalarVariables) |
+| `broken_connector_name` | TEXT | COPIED | PUBLIC | Parent (setScalarVariables) |
+
+---
+
+## 10. Setup Instructions
+
+### Step 1: Create Custom Connector in Matillion UI
+
+1. Go to **Manage Custom Connector** → **+ Add Connector**
+2. Name: `Fivetran TLS Manager`
+3. **Endpoint 1 — Get All Connections:**
+   - Method: `GET`
+   - URL: `https://api.fivetran.com/v1/connectors`
+   - Auth: Basic Auth (API Key + API Secret)
+   - Query Params: `limit` = 1000 (constant), `cursor` (configurable)
+   - Pagination: **Cursor** → Response property: `data.next_cursor`, Cursor param: `cursor`
+4. **Endpoint 2 — Test Connection:**
+   - Method: `POST`
+   - URL: `https://api.fivetran.com/v1/connectors/{connector_id}/test`
+   - URI Param: `connector_id` (configurable)
+   - Body: `{"trust_certificates": true}`
+   - Auth: Basic Auth
+
+### Step 2: Replace Placeholder in Pipeline
+
+1. Open `fivetran_tls_daily_fix.orch.yaml` in Designer
+2. Delete the "Fetch All Connections" SQL placeholder component
+3. Add your Custom Connector → select "Get All Connections" endpoint
+4. Set destination table: `RAW_FIVETRAN_CONNECTIONS`
+
+### Step 3: Configure Variables
+
+| Variable | Value to Set |
+|---|---|
+| `slack_webhook_url` | `https://hooks.slack.com/services/T.../B.../xxx` |
+| `email_recipient` | `avinash@inupup.com` |
+| `email_sender` | `noreply@inupup.com` |
+| `smtp_username` | Your SMTP username |
+| `smtp_hostname` | `smtp.gmail.com` (or your SMTP server) |
+
+### Step 4: Create Secret Definition
+
+In Matillion → **Secrets** → Create `smtp_password_secret` with your SMTP app password.
+
+### Step 5: Configure AWS (for SNS)
+
+Ensure your environment has cloud credentials with SNS publish permissions.
+
+### Step 6: Schedule
+
+Schedule `fivetran_tls_daily_fix.orch.yaml` → **Daily** → **9:30 PM UTC** (= 3:00 AM IST next day)
+
+---
+
+## 11. Error Handling & Edge Cases
+
+| Scenario | What Happens | Recovery |
 |---|---|---|
-| `start` | 2 | Main orch, Sub orch |
-| `create-table-v2` | 1 | Main orch |
-| `python-pushdown` | 4 | Main orch (fetch, Slack, email), Sub orch (test) |
-| `run-transformation` | 1 | Main orch |
-| `sql-executor` | 4 | Main orch (insert, summary), Sub orch (update, log fail) |
-| `table-iterator` | 1 | Main orch |
-| `run-orchestration` | 1 | Main orch (iterator target) |
-| `table-input` | 1 | Transformation |
-| `flatten-variant` | 1 | Transformation |
-| `filter` | 1 | Transformation |
-| `calculator` | 1 | Transformation |
-| `rewrite-table` | 1 | Transformation |
+| Fivetran API down | Custom Connector fails → pipeline stops at step 3 | Failure transition (not connected = pipeline fails) → retry next day |
+| No TLS-broken connectors found | Filter returns 0 rows → staging is empty | Iterator runs 0 times → Count Results shows all zeros → notifications still sent |
+| Pipeline runs twice same day | MERGE INTO skips duplicates (matched on BROKEN_ID + CHECK_DATE) | Safe to re-run |
+| Webhook POST fails for one connector | Sub-pipeline follows failure path → Mark as Failed | Other iterations continue (`breakOnFailure: No`) |
+| Slack webhook URL invalid | Webhook Post fails → follows **unconditional** to Email | Email + SNS still sent |
+| SMTP credentials wrong | Send Email fails → follows **unconditional** to SNS | SNS still sent |
+| AWS credentials missing | SNS fails → pipeline fails at last step | Cleanup doesn't run (staging persists, cleaned next run) |
 
 ---
 
-## 11. Variables Reference
+## 12. Version History
 
-### Daily_Fivetran_TLS_Fix.orch.yaml (Main Pipeline)
-
-| Variable | Type | Scope | Visibility | Default | Purpose |
+| Version | Date | Pipelines | Components | Python | Key Changes |
 |---|---|---|---|---|---|
-| `broken_id` | TEXT | COPIED | PRIVATE | `""` | Set by iterator — current connection ID |
-| `connector_name` | TEXT | COPIED | PRIVATE | `""` | Set by iterator — current connector name |
-| `service` | TEXT | COPIED | PRIVATE | `""` | Set by iterator — current service type |
-| `fivetran_api_key` | TEXT | SHARED | PRIVATE | `""` | Fivetran API key — set at runtime |
-| `fivetran_api_secret` | TEXT | SHARED | PRIVATE | `""` | Fivetran API secret — set at runtime |
-| `slack_webhook_url` | TEXT | SHARED | PRIVATE | `""` | Slack incoming webhook URL for notifications |
-| `notification_email` | TEXT | SHARED | PRIVATE | `""` | Email address for daily report (requires Snowflake email integration) |
-
-### Validate_TLS_Connection.orch.yaml (Sub-Pipeline)
-
-| Variable | Type | Scope | Visibility | Default | Purpose |
-|---|---|---|---|---|---|
-| `broken_id` | TEXT | COPIED | PUBLIC | `""` | Received from parent — connection to test |
-| `connector_name` | TEXT | COPIED | PUBLIC | `""` | Received from parent — for logging |
-| `service` | TEXT | COPIED | PUBLIC | `""` | Received from parent — for logging |
-| `fivetran_api_key` | TEXT | SHARED | PUBLIC | `""` | Received from parent — API auth |
-| `fivetran_api_secret` | TEXT | SHARED | PUBLIC | `""` | Received from parent — API auth |
-| `validation_result` | TEXT | COPIED | PRIVATE | `""` | Set by Python — API response JSON |
-| `api_status_code` | TEXT | COPIED | PRIVATE | `""` | Set by Python — HTTP status code |
-
-### Why COPIED Scope for Iterator Variables?
-
-Variables used in iterations MUST be `COPIED` scope. This ensures each iteration gets its own independent copy of the variable, preventing race conditions if concurrency is ever enabled.
-
----
-
-## 12. Log Table Schema
-
-### Table: `FIVETRAN_TLS_BROKEN_LOG`
-
-```sql
-CREATE TABLE IF NOT EXISTS FIVETRAN_TLS_BROKEN_LOG (
-  CHECK_DATE          DATE            COMMENT 'Date when broken connection was detected',
-  WATERMARK_DATE      TIMESTAMP_NTZ   COMMENT 'Exact timestamp of detection',
-  BROKEN_ID           VARCHAR(255)    COMMENT 'Fivetran connection ID',
-  CONNECTOR_NAME      VARCHAR(500)    COMMENT 'Human-readable connector name',
-  SERVICE             VARCHAR(255)    COMMENT 'Fivetran service type',
-  ERROR_REASON        VARIANT         COMMENT 'Full error/status JSON',
-  VALIDATED           BOOLEAN         DEFAULT FALSE COMMENT 'Whether re-tested today',
-  VALIDATION_RESULT   VARIANT         COMMENT 'JSON result from test API',
-  PRIMARY KEY (CHECK_DATE, BROKEN_ID)
-);
-```
-
-### Staging Table: `FIVETRAN_TLS_BROKEN_STAGING`
-
-Created automatically by the Rewrite Table component in the transformation pipeline. Contains the same columns as the log table minus `VALIDATION_RESULT` (which is NULL at this stage).
-
-### Temporary Table: `FIVETRAN_TLS_DAILY_SUMMARY`
-
-Created at the end of each run with today's summary:
-
-| Column | Type | Description |
-|---|---|---|
-| `REPORT_DATE` | DATE | Today's date |
-| `TOTAL_BROKEN_TODAY` | NUMBER | Total TLS-broken connections found |
-| `VALIDATED_TODAY` | NUMBER | Connections where validation was attempted |
-| `NOT_VALIDATED` | NUMBER | Connections not yet validated |
-
----
-
-## 13. Snowflake Prerequisites
-
-Before running the pipeline, the following must be configured in your Snowflake account:
-
-### 1. External Access Integration
-
-```sql
--- Allow outbound HTTPS to Fivetran API
-CREATE OR REPLACE NETWORK RULE fivetran_api_rule
-  MODE = EGRESS
-  TYPE = HOST_PORT
-  VALUE_LIST = ('api.fivetran.com:443');
-
-CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION FIVETRAN_API_ACCESS
-  ALLOWED_NETWORK_RULES = (fivetran_api_rule)
-  ENABLED = TRUE;
-
--- Grant usage to the role used by Matillion
-GRANT USAGE ON INTEGRATION FIVETRAN_API_ACCESS TO ROLE <your_matillion_role>;
-```
-
-### 2. Snowpark/Python Configuration
-
-Ensure your Snowflake account has:
-- Anaconda terms accepted (for Python packages)
-- Python UDF execution enabled
-- The warehouse used by Matillion has sufficient resources for Snowpark
-
-### 3. Role Permissions
-
-The Matillion execution role needs:
-- `CREATE TABLE` on the target schema
-- `INSERT`, `UPDATE`, `SELECT` on `FIVETRAN_TLS_BROKEN_LOG`
-- `CREATE OR REPLACE TABLE` for staging tables
-- `USAGE` on the `FIVETRAN_API_ACCESS` integration
-
-### 4. Slack Webhook (for Slack notifications)
-
-1. Go to [Slack API: Incoming Webhooks](https://api.slack.com/messaging/webhooks)
-2. Create a new Slack App or use an existing one.
-3. Enable **Incoming Webhooks** and create a webhook for your target channel.
-4. Copy the webhook URL (format: `https://hooks.slack.com/services/T.../B.../xxx`).
-5. Set the `slack_webhook_url` pipeline variable to this URL at runtime.
-
-> **Note:** The `FIVETRAN_API_ACCESS` external access integration's network rule must also allow `hooks.slack.com:443`. Update the rule:
-> ```sql
-> CREATE OR REPLACE NETWORK RULE fivetran_api_rule
->   MODE = EGRESS
->   TYPE = HOST_PORT
->   VALUE_LIST = ('api.fivetran.com:443', 'hooks.slack.com:443');
-> ```
-
-### 5. Snowflake Email Integration (for email notifications)
-
-```sql
--- Create an email integration
-CREATE OR REPLACE NOTIFICATION INTEGRATION tls_fix_email_integration
-  TYPE = EMAIL
-  ENABLED = TRUE
-  ALLOWED_RECIPIENTS = ('your-team@company.com');
-
--- Grant usage to Matillion's role
-GRANT USAGE ON INTEGRATION tls_fix_email_integration TO ROLE <your_matillion_role>;
-```
-
-Set the `notification_email` pipeline variable to the recipient address at runtime.
-
----
-
-## 14. Error Handling Strategy
-
-### Pipeline-Level
-
-| Scenario | Behavior |
-|---|---|
-| API fetch fails (network/auth) | Python Pushdown exits with failure → pipeline stops |
-| Transformation fails (malformed JSON) | Run Transformation exits with failure → pipeline stops |
-| Insert SQL fails | Pipeline stops before iteration |
-| Single iteration fails | Iterator continues (break_on_failure=No), failure logged |
-| All iterations complete with some failures | Iterator follows success path to summary |
-
-### Sub-Pipeline Level
-
-| Scenario | Behavior |
-|---|---|
-| API call succeeds | Updates log with response JSON, VALIDATED=TRUE |
-| API call throws exception | Python catches error, stores in variable, still updates log |
-| Python Pushdown itself fails | Failure path → Log Failure component updates log with error |
-
-### Key Design Principle: No Silent Failures
-
-Every failure is captured in the `VALIDATION_RESULT` column as JSON. Even if the API call completely fails, the log table will contain `{"error": "..."}` so you can investigate.
-
----
-
-## 15. Scheduling & Notification
-
-### Schedule Configuration
-
-| Setting | Value |
-|---|---|
-| **Pipeline** | `Daily_Fivetran_TLS_Fix.orch.yaml` |
-| **Frequency** | Daily |
-| **Time** | 3:00 AM IST = 9:30 PM UTC (previous day) |
-| **Variable Overrides** | `fivetran_api_key`, `fivetran_api_secret` |
-
-### Notification Implementation
-
-The pipeline now includes **both Slack and Email notifications** as the final two steps:
-
-| Step | Component | Method | Prerequisite |
-|---|---|---|---|
-| 9 | Send Slack Notification | `python-pushdown` → Slack Incoming Webhook | Slack App with webhook URL + network rule for `hooks.slack.com` |
-| 10 | Send Email Notification | `python-pushdown` → `SYSTEM$SEND_EMAIL()` | Snowflake email notification integration |
-
-**Both are gracefully optional:**
-- If `slack_webhook_url` is empty → Slack step prints "Skipping" and succeeds.
-- If `notification_email` is empty → Email step prints "Skipping" and succeeds.
-- If the Snowflake email integration isn't configured → Email step catches the error, prints the summary to the task log, and succeeds.
-- The pipeline **never fails** due to missing notification configuration.
-
-**Variable Overrides at schedule time:**
-
-| Setting | Value |
-|---|---|
-| **Pipeline** | `Daily_Fivetran_TLS_Fix.orch.yaml` |
-| **Frequency** | Daily |
-| **Time** | 3:00 AM IST = 9:30 PM UTC (previous day) |
-| **Variable Overrides** | `fivetran_api_key`, `fivetran_api_secret`, `slack_webhook_url`, `notification_email` |
-
-**Option C: Matillion Built-in Notifications**  
-In addition to the in-pipeline notifications, you can configure Matillion's built-in pipeline completion notifications at the environment level for an extra layer of alerting.
-
----
+| 1.0 | 2026-03-27 | 3 | 19 | 3 scripts | Initial: Python Pushdown for API calls |
+| 2.0 | 2026-03-27 | 2 | 15 | 2 scripts | Consolidated: Merged validation into main |
+| **3.0** | **2026-03-27** | **3** | **22** | **0** | **Zero-Python: Custom Connector, Extract Nested Data, Webhook Post, Send Email, SNS Message, triple notifications** |
