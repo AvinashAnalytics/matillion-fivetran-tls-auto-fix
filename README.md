@@ -35,6 +35,26 @@
 ### In One Sentence
 This pipeline **automatically finds and fixes Fivetran connectors that broke because of TLS/SSL certificate problems**, every single day, without any human intervention.
 
+### Who Should Read This Document?
+
+| Reader | What to Focus On |
+|---|---|
+| **Data Analysts** (like Avinash) | Sections 1-4 for understanding, Section 11 for querying the log table, Section 15 for FAQ |
+| **Data Engineers** | Sections 5-8 for pipeline architecture, Section 10 for internal mechanics |
+| **DevOps / Platform Engineers** | Section 13 for setup, Section 14 for error handling |
+| **Managers / Stakeholders** | Section 1 (business value), Section 9 (data flow overview) |
+| **New Team Members** | Read everything! Start here, go section by section |
+
+### How This Document Is Organized
+
+This blueprint follows a **"zoom in" structure**:
+1. **Sections 1-4** = Why? (The problem, the context, the API)
+2. **Sections 5-8** = What? (The architecture, every pipeline, every component)
+3. **Sections 9-11** = How? (Data flow, internal mechanics, table design)
+4. **Sections 12-17** = Setup & Reference (Variables, instructions, troubleshooting)
+
+You can read top-to-bottom for complete understanding, or jump to any section that answers your question.
+
 ### What Does That Actually Mean?
 
 Imagine you have 200 Fivetran connectors syncing data from databases, APIs, and cloud services into your Snowflake warehouse. One morning, 5 of them stop working because of a **TLS certificate error** — the secure connection between Fivetran and your source system can't be verified.
@@ -67,6 +87,32 @@ flowchart LR
 | Team finds out when dashboards are stale | Proactive notifications via 3 channels |
 | Same connectors break repeatedly without tracking | Trend analysis possible via log table |
 
+### How Long Does It Take?
+
+The entire pipeline runs in **2-10 minutes** depending on how many connectors you have:
+
+| Step | Typical Duration | Depends On |
+|---|---|---|
+| Fetch all connectors | 5-30 seconds | Number of connectors (API pagination) |
+| Transform & filter | 2-5 seconds | Number of raw rows to process |
+| MERGE into log | 1-2 seconds | Number of broken connectors found |
+| Validate each connector | 3-10 seconds **per connector** | Fivetran API response time |
+| Send notifications | 2-5 seconds | Network latency to Slack/SMTP/SNS |
+| **Total (10 broken connectors)** | **~2-3 minutes** | |
+| **Total (50 broken connectors)** | **~5-10 minutes** | |
+
+### What This Pipeline Does NOT Do
+
+It's important to understand the boundaries:
+
+| This Pipeline Does | This Pipeline Does NOT |
+|---|---|
+| Detects TLS/SSL/certificate broken connectors | Fix broken connectors caused by expired passwords, OAuth tokens, or firewall changes |
+| Applies `trust_certificates=true` fix | Modify connector configurations (host, port, database) |
+| Logs everything in a Snowflake audit table | Send alerts for non-TLS issues (you'd need a separate pipeline) |
+| Sends daily summary reports | Fix connectors where the source server is completely down |
+| Tracks trends over time | Replace Fivetran's built-in monitoring (it supplements it) |
+
 ---
 
 ## 2. The Problem We're Solving
@@ -79,17 +125,59 @@ flowchart LR
 2. **Integrity** — No one can tamper with the data in transit
 3. **Authentication** — Fivetran confirms it's talking to the real database, not an impersonator
 
+### How TLS Works — The Handshake (Simplified)
+
+Every time Fivetran connects to your database, a "TLS handshake" happens in milliseconds:
+
+```mermaid
+sequenceDiagram
+    participant F as Fivetran
+    participant DB as Your Database
+
+    F->>DB: 1. Hello! I want a secure connection.
+    DB-->>F: 2. Here's my certificate proving I'm who I say I am.
+    F->>F: 3. Let me verify this certificate...
+    Note right of F: Checks:<br>a) Is the certificate expired?<br>b) Was it issued by a trusted authority?<br>c) Does the name match?<br>d) Is the chain complete?
+    alt All checks pass
+        F->>DB: 4a. Certificate looks good! Let's encrypt our connection.
+        DB-->>F: 5. Agreed! Secure channel established.
+        Note over F,DB: Data syncs securely
+    else Any check fails
+        F->>F: 4b. Certificate REJECTED!
+        Note right of F: Connection FAILS.<br>Connector status = BROKEN.<br>Error logged in tasks + setup_tests.
+    end
+```
+
 ### How TLS Certificates Break Connections
 
 TLS relies on **certificates** — digital documents that prove a server's identity (like a passport for computers). Connections break when:
 
-| Failure Type | What Happened | Example Error Message |
-|---|---|---|
-| **Expired certificate** | The server's certificate passed its expiration date | `SSL certificate verify failed: certificate has expired` |
-| **Self-signed certificate** | The certificate wasn't issued by a trusted authority | `certificate signed by unknown authority` |
-| **Certificate chain broken** | An intermediate certificate is missing | `unable to get local issuer certificate` |
-| **TLS version mismatch** | Server uses an older TLS version | `TLS handshake failed: protocol version not supported` |
-| **Certificate authority not trusted** | Fivetran doesn't recognize who issued the cert | `the certificate authority is not trusted` |
+| Failure Type | What Happened | How Common | Example Error Message |
+|---|---|---|---|
+| **Expired certificate** | The server's certificate passed its expiration date | Very common (certs expire every 90 days to 2 years) | `SSL certificate verify failed: certificate has expired` |
+| **Self-signed certificate** | The certificate wasn't issued by a trusted authority (the server made its own) | Common for internal/dev servers | `certificate signed by unknown authority` |
+| **Certificate chain broken** | An intermediate certificate is missing (like a broken link in a chain of trust) | Moderately common | `unable to get local issuer certificate` |
+| **TLS version mismatch** | Server uses an older TLS version that Fivetran won't accept | Less common (TLS 1.0/1.1 deprecation) | `TLS handshake failed: protocol version not supported` |
+| **Certificate authority not trusted** | The CA that issued the cert isn't in Fivetran's trust store | Common with private/corporate CAs | `the certificate authority is not trusted` |
+| **Hostname mismatch** | The cert was issued for `db1.example.com` but you're connecting to `db2.example.com` | Occasional (DNS changes, load balancers) | `hostname verification failed` |
+
+### Visual: What a Certificate Chain Looks Like
+
+```mermaid
+flowchart TB
+    ROOT["Root CA Certificate<br><i>e.g., DigiCert Global Root G2</i><br><i>Built into Fivetran's trust store</i>"] --> INT["Intermediate CA Certificate<br><i>e.g., DigiCert SHA2 Secure Server CA</i><br><i>Links root to your server</i>"]
+    INT --> LEAF["Your Server Certificate<br><i>e.g., db.example.com</i><br><i>Proves your database's identity</i>"]
+
+    ROOT2["Self-Signed Certificate<br><i>No chain at all!</i><br><i>Server vouches for itself</i>"] --> PROB["Not trusted by Fivetran<br><i>because no recognized CA<br>verified this server</i>"]
+
+    style ROOT fill:#d4edda,stroke:#28a745,color:#000
+    style INT fill:#d4edda,stroke:#28a745,color:#000
+    style LEAF fill:#d4edda,stroke:#28a745,color:#000
+    style ROOT2 fill:#f8d7da,stroke:#dc3545,color:#000
+    style PROB fill:#f8d7da,stroke:#dc3545,color:#000
+```
+
+When ANY link in the chain is broken, expired, or unrecognized → **TLS handshake fails** → **connector breaks**.
 
 ### The Fix: `trust_certificates = true`
 
@@ -108,6 +196,39 @@ Good question! Because:
 - You need an **audit trail** — when did it break, when was it fixed, did the fix work?
 
 This pipeline handles all of that intelligently.
+
+### Security Considerations — Is `trust_certificates` Safe?
+
+This is an important question that security teams will ask. Here's the honest answer:
+
+| Scenario | Is It Safe? | Why |
+|---|---|---|
+| **Internal databases** (your own servers with self-signed certs) | ✅ Yes | You know and control the server. The cert is "untrusted" only because you didn't pay a CA. |
+| **Cloud databases** (RDS, Cloud SQL, Azure SQL) | ✅ Yes | Cloud providers use valid certs, but sometimes the chain isn't fully configured. |
+| **SSH tunnel connections** | ✅ Yes | Traffic is already encrypted through the SSH tunnel. |
+| **Public internet with unknown servers** | ⚠️ Caution | In theory, someone could impersonate the server (MITM attack). But Fivetran's connection is server-to-server, not browser-based, so risk is low. |
+| **Compliance-regulated environments** (PCI, HIPAA, SOC 2) | ⚠️ Review | Some compliance frameworks require certificate validation. Check with your security team before enabling. |
+
+**Bottom line:** For the vast majority of Fivetran connectors (especially to databases you own), `trust_certificates=true` is a safe and common configuration. The pipeline logs every action, so you have a full audit trail for compliance reviews.
+
+### Common TLS Error Messages You'll See in the Log
+
+Here are real error messages from Fivetran, grouped by root cause:
+
+**Certificate Trust Issues:**
+- `TLS certificate validation failed — the server certificate is not trusted by the client`
+- `SSL certificate verify failed: unable to get local issuer certificate`
+- `Certificate chain validation failed: self-signed certificate in certificate chain`
+- `the certificate authority is not trusted`
+
+**TLS Handshake Failures:**
+- `SSL/TLS handshake failed: the certificate authority is not trusted`
+- `TLS handshake error: certificate signed by unknown authority`
+- `SSL handshake has read 0 bytes and written 0 bytes`
+
+**Certificate Expiry:**
+- `Server certificate expires in 3 days` (warning, not yet broken)
+- `SSL certificate verify failed: certificate has expired`
 
 ---
 
@@ -155,12 +276,59 @@ To create a secret:
 
 ### Files in This Project
 
-| File | Type | Purpose |
-|---|---|---|
-| `fivetran_tls_daily_fix.orch.yaml` | Orchestration | Main pipeline — the coordinator |
-| `fivetran_tls_transform.tran.yaml` | Transformation | Data processing — filter & enrich |
-| `Validate_TLS_Connection.orch.yaml` | Orchestration | Sub-pipeline — tests one connector |
-| `docs/Daily_Fivetran_TLS_Fix_Blueprint.md` | Documentation | This file! |
+| File | Type | Purpose | Components |
+|---|---|---|---|
+| `fivetran_tls_daily_fix.orch.yaml` | Orchestration | Main pipeline — the coordinator | 12 |
+| `fivetran_tls_transform.tran.yaml` | Transformation | Data processing — filter & enrich | 6 |
+| `Validate_TLS_Connection.orch.yaml` | Orchestration | Sub-pipeline — tests one connector | 4 |
+| `docs/Daily_Fivetran_TLS_Fix_Blueprint.md` | Documentation | This file! | N/A |
+
+### Pre-Flight Checklist
+
+Before your first run, verify each item:
+
+- [ ] Fivetran API Key + Secret generated and saved
+- [ ] `fivetran_api_secret` secret created in Matillion
+- [ ] `smtp_password_secret` secret created in Matillion
+- [ ] Custom Connector created in Matillion UI (replaces SQL placeholder)
+- [ ] `slack_webhook_url` variable updated with your Slack webhook
+- [ ] `email_recipient` variable updated with your email address
+- [ ] `email_sender` and `smtp_username` variables configured
+- [ ] `smtp_hostname` variable set to your SMTP server
+- [ ] AWS SNS topic created (or SNS component skipped if not using AWS)
+- [ ] Snowflake role has CREATE TABLE, INSERT, UPDATE, DROP TABLE permissions
+- [ ] Pipeline schedule created (Daily at 9:30 PM UTC / 3:00 AM IST)
+- [ ] Test run completed successfully
+
+### Snowflake Permissions Required
+
+The Matillion environment's Snowflake role needs these permissions on the target schema:
+
+```sql
+-- Grant these to your Matillion role (replace MATILLION_ROLE and schema as needed)
+GRANT CREATE TABLE ON SCHEMA "YOUR_DB"."PUBLIC" TO ROLE "MATILLION_ROLE";
+GRANT INSERT, UPDATE, DELETE, SELECT ON ALL TABLES IN SCHEMA "YOUR_DB"."PUBLIC" TO ROLE "MATILLION_ROLE";
+GRANT INSERT, UPDATE, DELETE, SELECT ON FUTURE TABLES IN SCHEMA "YOUR_DB"."PUBLIC" TO ROLE "MATILLION_ROLE";
+```
+
+**Specific tables the pipeline creates/uses:**
+
+| Table | Created By | Lifetime | Operations Performed |
+|---|---|---|---|
+| `RAW_FIVETRAN_CONNECTIONS` | Custom Connector (Component 3) | Temporary (dropped at end) | CREATE, INSERT, SELECT, DROP |
+| `FIVETRAN_TLS_BROKEN_STAGING` | Rewrite Table (Component 18) | Temporary (dropped at end) | CREATE, INSERT, SELECT, DROP |
+| `FIVETRAN_TLS_BROKEN_LOG` | Create Table v2 (Component 2) | Permanent (keeps history) | CREATE IF NOT EXISTS, SELECT, INSERT (via MERGE), UPDATE |
+
+### Network Requirements
+
+The Matillion environment needs outbound access to:
+
+| Destination | Port | Protocol | Purpose |
+|---|---|---|---|
+| `api.fivetran.com` | 443 | HTTPS | Fivetran REST API calls |
+| Your SMTP server (e.g., `smtp.gmail.com`) | 587 | SMTP/TLS | Sending email notifications |
+| Your Slack webhook URL | 443 | HTTPS | Slack notifications |
+| AWS SNS endpoint (e.g., `sns.us-east-1.amazonaws.com`) | 443 | HTTPS | SNS notifications |
 
 ---
 
@@ -463,6 +631,49 @@ Tells Fivetran to accept the server's SSH host key fingerprint. Useful when conn
 {"code": "Error", "message": "Connection test failed: host unreachable"}
 ```
 
+### API Rate Limits
+
+Fivetran has API rate limits to prevent abuse:
+
+| Limit Type | Value | What It Means |
+|---|---|---|
+| **Requests per minute** | 100 requests/min | You can make 100 API calls per minute |
+| **Connector test requests** | Lower limit | Testing connectors is more resource-intensive |
+
+**How our pipeline handles this:**
+- The Table Iterator runs **sequentially** (one connector at a time), not in parallel
+- Each validation takes 3-10 seconds, so even 50 connectors = ~50 requests over 5 minutes = well within limits
+- The Custom Connector handles pagination automatically, staying within limits
+
+### API Error Codes Reference
+
+| HTTP Status | Meaning | What Our Pipeline Does |
+|---|---|---|
+| `200 OK` | Request succeeded | Processes the response data |
+| `400 Bad Request` | Invalid request format | Webhook POST follows `failure` transition |
+| `401 Unauthorized` | Invalid API credentials | Pipeline fails at Fetch step (check your API key/secret) |
+| `403 Forbidden` | API key doesn't have permission | Pipeline fails (check Fivetran role permissions) |
+| `404 Not Found` | Connector ID doesn't exist | Webhook POST follows `failure` transition |
+| `429 Too Many Requests` | Rate limit exceeded | Retry after waiting (Custom Connector handles this) |
+| `500 Internal Server Error` | Fivetran server issue | Pipeline fails (temporary — retry later) |
+
+### Understanding HTTP Basic Auth
+
+Basic Authentication works like this:
+
+```mermaid
+sequenceDiagram
+    participant P as Our Pipeline
+    participant F as Fivetran API
+
+    Note over P: Combine API Key + API Secret<br>Format: "api_key:api_secret"<br>Then Base64 encode it
+    P->>F: GET /v1/connectors<br>Header: Authorization: Basic dXNlcjpwYXNz...
+    Note over F: Fivetran decodes the header,<br>verifies the API Key + Secret
+    F-->>P: 200 OK with connector data
+```
+
+You don't need to do any of this manually — the Custom Connector component handles encoding and sending the auth header automatically. You just provide the API Key and Secret reference.
+
 ---
 
 ## 5. Architecture Overview
@@ -564,6 +775,40 @@ flowchart TB
     style LOG fill:#d4edda,stroke:#28a745,color:#000
 ```
 
+### Understanding Transition Types
+
+In orchestration pipelines, components are connected by **transitions** — arrows that control the flow. There are different types:
+
+| Transition Type | When It Fires | Icon | Used For |
+|---|---|---|---|
+| `unconditional` | **Always** — whether the previous component succeeded, failed, or errored | ➔ | Start → next step, notification chains (proceed even if notification fails) |
+| `success` | **Only if** the previous component completed without errors | ✔️➔ | Most transitions — only proceed if the step worked |
+| `failure` | **Only if** the previous component errored | ❌➔ | Error handling branches (e.g., Test Connection → Mark as Failed) |
+
+```mermaid
+flowchart LR
+    A["Component A"] -- "success<br>(only if A worked)" --> B["Component B"]
+    A -- "failure<br>(only if A failed)" --> C["Error Handler"]
+    B -- "unconditional<br>(always, regardless)" --> D["Component D"]
+```
+
+**In our pipeline:**
+- Most transitions are `success` — "only proceed if the last step worked"
+- Notification transitions are `unconditional` — "send the next notification even if the previous one failed"
+- Validation uses `success`/`failure` branching — "if Fivetran test passed, mark fixed; if it failed, mark failed"
+
+### Understanding Orchestration vs. Transformation
+
+| Aspect | Orchestration (.orch.yaml) | Transformation (.tran.yaml) |
+|---|---|---|
+| **Purpose** | Control flow — "do this, then that" | Data processing — "transform this data" |
+| **Components** | SQL Executor, Create Table, API calls, notifications, iterators | Table Input, Filter, Calculator, Join, Aggregate, Output |
+| **Connections** | Transitions (arrows with conditions) | Sources (data flows from one component to the next) |
+| **Execution** | Sequential, one component at a time (unless parallel branches) | Compiled into a single SQL query (Snowflake executes it all at once) |
+| **Can call** | Other orchestrations AND transformations | Nothing — transformations are "leaf nodes" |
+| **Variables** | Can SET and GET variables | Can only READ variables |
+| **Analogy** | A project manager giving instructions | An assembly line processing materials |
+
 ### Complete Component Inventory (All 22)
 
 | # | Component Name | Component Type | Pipeline | What It Does (Plain English) |
@@ -637,10 +882,26 @@ flowchart LR
 - **Transition:** `unconditional` → Init Log Table (always proceeds, no conditions)
 
 #### Component 2: Init Log Table
-- **Type:** `create-table-v2`
-- **What it does:** Creates the `FIVETRAN_TLS_BROKEN_LOG` table in Snowflake. Uses `Create If Not Exists` so it only creates the table on the very first run. On subsequent runs, it sees the table already exists and moves on.
-- **Why this is important:** Without this, the first run would fail when trying to MERGE into a non-existent table.
-- **Table created:** 16 columns (see Section 11 for full schema)
+- **Type:** `create-table-v2` ([Documentation](https://docs.matillion.com/data-productivity-cloud/designer/docs/create-table-v2/))
+- **What it does:** Creates the `FIVETRAN_TLS_BROKEN_LOG` table in Snowflake. Uses `Create If Not Exists` so it only creates the table on the very first run. On subsequent runs, it sees the table already exists and moves on instantly.
+- **Why this is important:** Without this, the first run would fail when trying to MERGE into a non-existent table. By making table creation the first step, the pipeline is **self-initializing** — you can deploy it to a new environment and it sets itself up.
+
+**Key Parameters:**
+
+| Parameter | Value | Why This Value |
+|---|---|---|
+| `createMethod` | `Create If Not Exists` | Only creates on first run; does nothing on subsequent runs |
+| `database` | `[Environment Default]` | Uses the environment's configured database (flexible across envs) |
+| `schema` | `[Environment Default]` | Same — adapts to whatever schema the environment uses |
+| `table` | `FIVETRAN_TLS_BROKEN_LOG` | Descriptive name indicating purpose |
+| `snowflakeTableType` | `Permanent` | Data persists across sessions (not temporary) |
+| `comment` | `"Historical log of Fivetran connectors broken due to TLS/SSL/certificate issues"` | Self-documenting — shows in Snowflake's SHOW TABLES |
+
+**Table created:** 16 columns (see Section 11 for full schema with every column explained)
+
+**What `[Environment Default]` means:**
+In Matillion, each environment has a configured Snowflake database and schema. Using `[Environment Default]` means the pipeline automatically uses the right database/schema for whatever environment it runs in (dev, staging, production). You don't need to hard-code database names.
+
 - **Transition:** `success` → Fetch All Connections
 
 #### Component 3: Fetch All Connections
@@ -703,9 +964,44 @@ If the pipeline runs twice in one day (e.g., you trigger it manually after the s
   4. After all rows are processed, follows the `success` transition
 
 **Configuration details:**
-- **Concurrency:** Sequential (one at a time, not parallel) — safer for API rate limits
-- **Sort:** Ascending by BROKEN_ID — consistent ordering
-- **Break on Failure:** No — if one connector fails validation, keep going with the others
+
+| Parameter | Value | Why This Value |
+|---|---|---|
+| `mode` | `Basic` | Simple row-by-row iteration (vs. Advanced with custom SQL) |
+| `database` | `[Environment Default]` | Reads from the environment's database |
+| `schema` | `[Environment Default]` | Reads from the environment's schema |
+| `targetTable` | `FIVETRAN_TLS_BROKEN_STAGING` | The filtered table from transformation |
+| `concurrency` | `Sequential` | One at a time (safer for API rate limits; avoids overwhelming Fivetran) |
+| `sort` | `Ascending` | Processes connectors in alphabetical order (consistent, predictable) |
+| `breakOnFailure` | `No` | If connector A's validation fails, still validate connector B, C, etc. |
+
+**Column Mapping — How Table Columns Become Variables:**
+
+| Table Column | → Maps To Variable | Variable Type | Why |
+|---|---|---|---|
+| `BROKEN_ID` | `broken_connector_id` | TEXT (COPIED) | Used in webhook URL: `.../connectors/${broken_connector_id}/test` |
+| `CONNECTOR_SERVICE` | `broken_connector_name` | TEXT (COPIED) | Used in logging for human-readable identification |
+
+**Sequential vs. Concurrent Execution:**
+
+```mermaid
+flowchart TB
+    subgraph SEQ ["Sequential (what we use)"]
+        direction LR
+        S1["relief_harden"] --> S2["warm_feather"]
+        S2 --> DONE1["Done"]
+    end
+    subgraph CON ["Concurrent (alternative)"]
+        direction LR
+        C1["relief_harden"] --> DONE2["Done"]
+        C2["warm_feather"] --> DONE2
+    end
+```
+
+We use **Sequential** because:
+1. **API rate limits** — Fivetran's test endpoint has lower rate limits
+2. **Simpler debugging** — if something fails, you know exactly which connector caused it
+3. **Variable safety** — COPIED scope prevents race conditions, but sequential is still cleaner
 
 - **Iteration target:** Validate Connection (Component 7)
 - **Transition after all iterations:** `success` → Count Results
@@ -807,6 +1103,24 @@ Raw materials (table) → Step 1 → Step 2 → Step 3 → Finished product (new
 ```
 
 Unlike orchestration pipelines (which use transitions/arrows), transformation components are connected via **sources** — each component says "I get my data from this other component."
+
+**Important concept — Transformations compile to SQL:**
+When Matillion runs a transformation pipeline, it doesn't execute each component separately. Instead, it **compiles the entire chain into a single SQL query** and sends it to Snowflake. This means:
+- All 6 components in our transformation become one efficient SQL statement
+- Snowflake optimizes the query plan internally
+- There's no round-trip between Matillion and Snowflake for each component
+- The intermediate states shown in Section 9 are conceptual — Snowflake processes them as one operation
+
+```mermaid
+flowchart LR
+    subgraph VISUAL ["What you see in the Designer"]
+        A["Table Input"] --> B["Extract"] --> C["Calculator"] --> D["Filter"] --> E["Calculator"] --> F["Rewrite Table"]
+    end
+    subgraph ACTUAL ["What actually runs in Snowflake"]
+        SQL["One compiled SQL query<br>that does ALL of the above<br>in a single execution"]
+    end
+    VISUAL -. "compiles to" .-> ACTUAL
+```
 
 ### Component-by-Component Deep Dive
 
@@ -1140,6 +1454,44 @@ Back in the orchestration pipeline. The MERGE inserts these 2 rows into the perm
 Both `RAW_FIVETRAN_CONNECTIONS` and `FIVETRAN_TLS_BROKEN_STAGING` are dropped.
 Only `FIVETRAN_TLS_BROKEN_LOG` remains — the permanent audit trail.
 
+### What the Log Table Looks Like After Multiple Days
+
+Here's what builds up over a week of daily runs:
+
+| BROKEN_ID | CONNECTOR_SERVICE | CHECK_DATE | VALIDATION_STATUS | VALIDATION_MESSAGE |
+|---|---|---|---|---|
+| relief_harden | mysql_rds | 2026-03-27 | success | Connection test passed with trust_certificates=true |
+| warm_feather | sql_server_rds | 2026-03-27 | failed | Connection test failed - manual review required |
+| warm_feather | sql_server_rds | 2026-03-28 | failed | Connection test failed - manual review required |
+| relief_harden | mysql_rds | 2026-03-28 | success | Connection test passed with trust_certificates=true |
+| new_spark | mongodb | 2026-03-28 | success | Connection test passed with trust_certificates=true |
+| warm_feather | sql_server_rds | 2026-03-29 | success | Connection test passed with trust_certificates=true |
+
+**Notice:**
+- `warm_feather` appears 3 days in a row — broke on the 27th, stayed broken on the 28th, finally fixed on the 29th
+- `relief_harden` appears on both the 27th and 28th — it got fixed, then broke again (a cert was temporarily renewed, then expired again)
+- `new_spark` is new on the 28th — a new connector that developed a TLS issue
+- Each row is a **separate daily snapshot** — you can see the full history of each connector
+
+### Data Flow Summary Diagram
+
+```mermaid
+flowchart TB
+    subgraph COUNTS ["Row Counts Through Pipeline"]
+        direction LR
+        R1["4 rows<br>All connectors"] --> R2["4 rows<br>+ extracted columns"]
+        R2 --> R3["4 rows<br>+ renamed columns"]
+        R3 --> R4["2 rows<br>TLS only"]
+        R4 --> R5["2 rows<br>+ watermarks"]
+        R5 --> R6["2 rows<br>in staging"]
+        R6 --> R7["2 rows<br>merged to log"]
+        R7 --> R8["2 iterations<br>1 success, 1 failed"]
+    end
+
+    style R4 fill:#fff3cd,stroke:#ffc107,color:#000
+    style R8 fill:#d4edda,stroke:#28a745,color:#000
+```
+
 ---
 
 ## 10. How Every Component Works Internally
@@ -1178,15 +1530,15 @@ sequenceDiagram
 
     Note over END: Reads configuration: extract these fields from 'status' column
 
-    END->>END: Extract status.setup_state as VARCHAR → STATUS_SETUP_STATE
-    END->>END: Extract status.tasks as VARIANT → STATUS_TASKS
-    END->>END: Extract status.warnings as VARIANT → STATUS_WARNINGS
-    END->>END: Extract status.setup_tests as VARIANT → SETUP_TESTS
+    END->>END: Extract status.setup_state as VARCHAR to STATUS_SETUP_STATE
+    END->>END: Extract status.tasks as VARIANT to STATUS_TASKS
+    END->>END: Extract status.warnings as VARIANT to STATUS_WARNINGS
+    END->>END: Extract status.setup_tests as VARIANT to SETUP_TESTS
 
-    Note over END: Casting: if any value can't be parsed, replace with NULL
-    Note over END: Outer join: keep the row even if some fields are missing
+    Note over END: Casting - if any value cannot be parsed, replace with NULL
+    Note over END: Outer join - keep the row even if some fields are missing
 
-    END->>OUT: Original 11 columns + 4 new extracted columns = 15 columns
+    END->>OUT: Original 11 columns plus 4 new extracted columns equals 15 columns
 ```
 
 ### Table Iterator — How the Loop Works
@@ -1313,6 +1665,83 @@ ORDER BY CHECK_DATE DESC;
 
 Having both lets you do both high-level daily reporting AND precise debugging when needed.
 
+### Advanced Analytical Queries
+
+**Which connectors have been broken the most in the last 30 days?**
+```sql
+SELECT
+    BROKEN_ID,
+    CONNECTOR_SERVICE,
+    COUNT(*) AS days_broken,
+    MIN(CHECK_DATE) AS first_seen,
+    MAX(CHECK_DATE) AS last_seen,
+    SUM(CASE WHEN VALIDATION_STATUS = 'success' THEN 1 ELSE 0 END) AS times_auto_fixed,
+    SUM(CASE WHEN VALIDATION_STATUS = 'failed' THEN 1 ELSE 0 END) AS times_still_broken
+FROM FIVETRAN_TLS_BROKEN_LOG
+WHERE CHECK_DATE >= DATEADD(day, -30, CURRENT_DATE())
+GROUP BY BROKEN_ID, CONNECTOR_SERVICE
+ORDER BY days_broken DESC;
+```
+
+**Daily fix success rate over the last 2 weeks:**
+```sql
+SELECT
+    CHECK_DATE,
+    COUNT(*) AS total_broken,
+    SUM(CASE WHEN VALIDATION_STATUS = 'success' THEN 1 ELSE 0 END) AS fixed,
+    SUM(CASE WHEN VALIDATION_STATUS = 'failed' THEN 1 ELSE 0 END) AS still_broken,
+    ROUND(fixed * 100.0 / NULLIF(total_broken, 0), 1) AS fix_rate_pct
+FROM FIVETRAN_TLS_BROKEN_LOG
+WHERE CHECK_DATE >= DATEADD(day, -14, CURRENT_DATE())
+GROUP BY CHECK_DATE
+ORDER BY CHECK_DATE DESC;
+```
+
+**Connectors that broke yesterday but weren't broken the day before (new issues):**
+```sql
+SELECT l.*
+FROM FIVETRAN_TLS_BROKEN_LOG l
+WHERE l.CHECK_DATE = DATEADD(day, -1, CURRENT_DATE())
+  AND l.BROKEN_ID NOT IN (
+    SELECT BROKEN_ID FROM FIVETRAN_TLS_BROKEN_LOG
+    WHERE CHECK_DATE = DATEADD(day, -2, CURRENT_DATE())
+  );
+```
+
+**Average time between discovery and validation:**
+```sql
+SELECT
+    AVG(DATEDIFF(second, WATERMARK_DATE, VALIDATED_AT)) AS avg_seconds_to_validate,
+    MIN(DATEDIFF(second, WATERMARK_DATE, VALIDATED_AT)) AS fastest,
+    MAX(DATEDIFF(second, WATERMARK_DATE, VALIDATED_AT)) AS slowest
+FROM FIVETRAN_TLS_BROKEN_LOG
+WHERE VALIDATED_AT IS NOT NULL;
+```
+
+**Which Fivetran groups have the most TLS issues?**
+```sql
+SELECT
+    GROUP_ID,
+    COUNT(DISTINCT BROKEN_ID) AS unique_connectors,
+    COUNT(*) AS total_incidents,
+    LISTAGG(DISTINCT CONNECTOR_SERVICE, ', ') AS service_types
+FROM FIVETRAN_TLS_BROKEN_LOG
+GROUP BY GROUP_ID
+ORDER BY total_incidents DESC;
+```
+
+### Building a Dashboard
+
+You can create a BI dashboard (in Looker, Tableau, Power BI, etc.) on top of this log table with these recommended visuals:
+
+| Visual | Query Basis | Shows |
+|---|---|---|
+| **Line chart** | Daily fix_rate_pct over time | Trending — are we getting better or worse? |
+| **Bar chart** | Top 10 most-broken connectors | Focus areas — which connectors need permanent fixes? |
+| **KPI cards** | Today's total_broken, total_fixed, total_failed | Current state at a glance |
+| **Table** | Today's failed connectors with details | Action items — what needs manual review? |
+| **Stacked bar** | Daily broken count by connector service type | Pattern detection — are certain service types more prone? |
+
 ---
 
 ## 12. Pipeline Variables — Complete Reference
@@ -1360,6 +1789,67 @@ Variables are named placeholders that store values during pipeline execution. Th
 | `broken_connector_name` | TEXT | COPIED | PUBLIC | `""` | Passed from parent via `setScalarVariables` |
 
 > **Why PUBLIC visibility?** PUBLIC variables can be overridden when calling the pipeline from another pipeline. PRIVATE variables cannot be set from outside.
+
+### Variable Lifecycle — How Variables Flow Through Execution
+
+```mermaid
+sequenceDiagram
+    participant SCHED as Scheduler
+    participant MAIN as Main Orchestration
+    participant ITER as Table Iterator
+    participant VAL as Validation Sub-Orch
+
+    Note over SCHED: Pipeline triggered at 3:00 AM IST
+    SCHED->>MAIN: Start pipeline with default variable values
+    Note over MAIN: All 13 variables initialized to defaults<br>slack_webhook_url = configured URL<br>total_broken = 0<br>broken_connector_id = empty
+
+    Note over MAIN: Components 1-5 execute...
+
+    MAIN->>MAIN: Count Results runs SQL SETs
+    Note over MAIN: total_broken = 2<br>total_fixed = 0 (not validated yet)<br>check_date = '2026-03-27'
+
+    Note over MAIN: Wait, that's wrong! Count Results runs AFTER iteration.
+    Note over MAIN: Let me show the correct flow:
+
+    MAIN->>ITER: Iterate Broken IDs starts
+    ITER->>ITER: Reads staging table: 2 rows
+
+    Note over ITER: Iteration 1
+    ITER->>MAIN: SET broken_connector_id = 'relief_harden'
+    ITER->>MAIN: SET broken_connector_name = 'mysql_rds'
+    MAIN->>VAL: Run Validation (passes variables)
+    Note over VAL: broken_connector_id = 'relief_harden'
+    VAL->>VAL: Test + Update log
+    VAL-->>MAIN: Done
+
+    Note over ITER: Iteration 2
+    ITER->>MAIN: SET broken_connector_id = 'warm_feather'
+    ITER->>MAIN: SET broken_connector_name = 'sql_server_rds'
+    MAIN->>VAL: Run Validation (passes variables)
+    Note over VAL: broken_connector_id = 'warm_feather'
+    VAL->>VAL: Test + Update log
+    VAL-->>MAIN: Done
+
+    MAIN->>MAIN: Count Results runs SQL SETs
+    Note over MAIN: NOW the counts are accurate:<br>total_broken = 2<br>total_fixed = 1<br>total_failed = 1
+
+    MAIN->>MAIN: Notifications use these variables
+```
+
+### Variable Scoping — COPIED vs SHARED Explained
+
+| Scope | Behavior | When to Use | Our Usage |
+|---|---|---|---|
+| **SHARED** | One copy for the entire pipeline. All components see the same value. If one component changes it, all subsequent components see the new value. | Configuration values, counters, report data | `slack_webhook_url`, `total_broken`, `check_date` |
+| **COPIED** | Each concurrent branch gets its own copy. Changes in one branch don't affect other branches. | Iterator variables, anything that changes per-iteration | `broken_connector_id`, `broken_connector_name` |
+
+**Why this matters for iterators:**
+If `broken_connector_id` were SHARED and the iterator ran concurrently:
+- Iteration 1 sets `broken_connector_id = 'relief_harden'`
+- Iteration 2 immediately sets `broken_connector_id = 'warm_feather'`
+- Iteration 1's validation now uses `warm_feather` instead of `relief_harden`! 💥
+
+With COPIED scope, each iteration has its own copy, preventing this race condition.
 
 ---
 
@@ -1498,6 +1988,58 @@ The MERGE INTO statement prevents duplicates. The second run:
 
 For example, a connector broken by BOTH a TLS issue AND a password expiry. Our filter will catch it (because it contains TLS keywords). The validation will run `trust_certificates=true`, which might fix the TLS part but the connector might still fail due to the password issue. In that case, `VALIDATION_STATUS = 'failed'` and the message will indicate manual review is needed.
 
+### What If Snowflake Is Under Maintenance?
+
+If Snowflake is completely unavailable, the pipeline cannot run at all (it needs Snowflake for every step). The scheduled run will fail, and you'll see the failure in Matillion's execution history. The next day's run will work normally once Snowflake is back.
+
+### What If You Have Hundreds of Broken Connectors?
+
+With sequential execution at ~5 seconds per connector:
+- 10 connectors: ~50 seconds
+- 50 connectors: ~4 minutes
+- 100 connectors: ~8 minutes
+- 500 connectors: ~42 minutes
+
+If you regularly have 100+ TLS-broken connectors, consider switching the iterator to `Concurrent` execution (faster but uses more API quota).
+
+### Error Recovery Flow
+
+```mermaid
+flowchart TB
+    START["Pipeline starts"] --> INIT{"Init Log Table?"}
+    INIT -- "Success" --> FETCH{"Fetch All Connections?"}
+    INIT -- "Failure" --> E1["STOP: Snowflake permission issue<br>Check role has CREATE TABLE"]
+    FETCH -- "Success" --> TRANS{"Transform and Filter?"}
+    FETCH -- "Failure" --> E2["STOP: API issue<br>Check API key, network, Fivetran status"]
+    TRANS -- "Success" --> MERGE{"Merge Into Log?"}
+    TRANS -- "Failure" --> E3["STOP: Transformation issue<br>Check table exists, columns match"]
+    MERGE -- "Success" --> ITER{"Iterate?"}
+    MERGE -- "Failure" --> E4["STOP: SQL issue<br>Check MERGE syntax, column types"]
+    ITER -- "Success" --> COUNT["Count Results"]
+    ITER -- "Partial failures" --> COUNT
+    COUNT --> NOTIFY["Notifications<br>(unconditional chain)"]
+    NOTIFY --> CLEAN["Cleanup"]
+
+    style E1 fill:#f8d7da,stroke:#dc3545,color:#000
+    style E2 fill:#f8d7da,stroke:#dc3545,color:#000
+    style E3 fill:#f8d7da,stroke:#dc3545,color:#000
+    style E4 fill:#f8d7da,stroke:#dc3545,color:#000
+```
+
+### Troubleshooting Guide
+
+| Symptom | Likely Cause | How to Fix |
+|---|---|---|
+| Pipeline fails at Init Log Table | Snowflake permission issue | Grant CREATE TABLE to Matillion role |
+| Pipeline fails at Fetch All Connections | API credentials wrong or placeholder not replaced | Create Custom Connector and replace SQL placeholder |
+| Transform returns 0 rows when you expect some | Filter keywords don't match error messages | Check the actual error messages in `RAW_FIVETRAN_CONNECTIONS.status` column |
+| MERGE fails with column mismatch | Log table schema doesn't match staging | Drop and recreate the log table (Init will recreate it) |
+| Iterator runs but all validations fail | Fivetran API auth not configured on webhook | Add Basic Auth headers to the Webhook POST component |
+| Slack notification fails | Invalid webhook URL | Test the URL with `curl -X POST -H 'Content-type: application/json' --data '{"text":"test"}' YOUR_URL` |
+| Email fails | Wrong SMTP credentials or port | Test SMTP settings with a mail client first; ensure App Password for Gmail |
+| SNS fails | AWS credentials not configured | Check Matillion's AWS role has `sns:Publish` permission |
+| Log table grows too large | No data retention policy | Add a cleanup step: `DELETE FROM FIVETRAN_TLS_BROKEN_LOG WHERE CHECK_DATE < DATEADD(day, -90, CURRENT_DATE())` |
+
 ---
 
 ## 15. Frequently Asked Questions
@@ -1526,6 +2068,42 @@ A: The Matillion role needs:
 - `INSERT`, `UPDATE`, `MERGE` on the log table
 - `DROP TABLE` for cleanup
 - `SELECT` on staging tables
+
+### Q: Can I test this without affecting production Fivetran connectors?
+A: Yes! The `POST /test` endpoint only **tests** the connection — it doesn't modify connector settings permanently. It temporarily tests with `trust_certificates=true` but doesn't save that setting. You'd need a separate API call to permanently update the connector config.
+
+### Q: What if I want to permanently set trust_certificates on fixed connectors?
+A: Add a step after "Mark as Fixed" that calls `PATCH /v1/connectors/{id}` with `{"config": {"trust_certificates": true}}`. This would permanently update the connector config so it doesn't break again.
+
+### Q: Can I filter for different error types (not just TLS)?
+A: Absolutely! Modify the filter in Pipeline 2. For example, to catch OAuth issues instead:
+```sql
+LOWER("STATUS_TASKS"::VARCHAR) LIKE '%oauth%'
+OR LOWER("STATUS_TASKS"::VARCHAR) LIKE '%token expired%'
+OR LOWER("STATUS_TASKS"::VARCHAR) LIKE '%re-authenticate%'
+```
+
+### Q: Can I send notifications to multiple Slack channels?
+A: Yes, duplicate the Notify Slack component and point each one to a different webhook URL. Or use a single webhook that posts to a channel, and set up Slack's channel forwarding.
+
+### Q: How do I check if the pipeline ran today?
+A: 
+```sql
+SELECT CHECK_DATE, COUNT(*) AS connectors_logged, MAX(WATERMARK_DATE) AS last_run
+FROM FIVETRAN_TLS_BROKEN_LOG
+WHERE CHECK_DATE = CURRENT_DATE()
+GROUP BY CHECK_DATE;
+```
+If this returns 0 rows, either the pipeline hasn't run today or there were no TLS-broken connectors.
+
+### Q: Can I add this to an existing orchestration pipeline?
+A: Yes! You can add a `run-orchestration` component to your existing pipeline that calls `fivetran_tls_daily_fix.orch.yaml`. This lets you chain it with other daily maintenance tasks.
+
+### Q: What happens if Fivetran adds new status fields in the future?
+A: The pipeline won't break — Extract Nested Data only extracts the fields we've configured. New API fields are simply ignored. If you want to capture new fields, add them to the Extract Nested Data configuration and the log table schema.
+
+### Q: Can I backfill historical data?
+A: Not directly — the Fivetran API shows current state, not historical. But once this pipeline is running daily, it builds history over time. After 30 days, you'll have 30 days of daily snapshots.
 
 ---
 
@@ -1558,6 +2136,26 @@ A: The Matillion role needs:
 | **VARIANT** | A Snowflake data type that can store semi-structured data (JSON, arrays, nested objects) |
 | **Watermark** | A timestamp marking when data was processed or discovered |
 | **Webhook** | An HTTP callback — a URL that accepts incoming HTTP requests (e.g., Slack incoming webhooks) |
+| **YAML** | YAML Ain't Markup Language — a human-readable file format used for pipeline definitions (.orch.yaml, .tran.yaml) |
+| **Base64** | A way to encode binary data as text characters — used in HTTP Basic Auth to encode credentials |
+| **VARIANT** | A Snowflake data type that can store any JSON structure (objects, arrays, nested data) without a fixed schema |
+| **COALESCE** | A SQL function that returns the first non-NULL value from a list — used for providing fallback values |
+| **CURRENT_DATE()** | A Snowflake function that returns today's date (e.g., 2026-03-27) |
+| **CURRENT_TIMESTAMP()** | A Snowflake function that returns the current date AND time with millisecond precision |
+| **DATEADD** | A Snowflake function that adds/subtracts time from a date (e.g., DATEADD(day, -7, CURRENT_DATE()) = 7 days ago) |
+| **DPC** | Data Productivity Cloud — Matillion's cloud-based platform for building data pipelines |
+| **ETL/ELT** | Extract-Transform-Load / Extract-Load-Transform — patterns for moving and processing data |
+| **HTTP Method** | The type of API request: GET (read), POST (create/action), PUT (replace), PATCH (update), DELETE (remove) |
+| **LIKE** | SQL operator for pattern matching — `%` matches any characters (e.g., `LIKE '%tls%'` matches any string containing "tls") |
+| **LOWER()** | SQL function that converts text to lowercase — used for case-insensitive keyword matching |
+| **MERGE INTO** | SQL command that combines INSERT and UPDATE: if the row exists, update it; if not, insert it |
+| **NULL** | A special value meaning "no data" or "unknown" — different from empty string or zero |
+| **Pipeline Variable** | A named placeholder in a pipeline that stores a value (text, number, or grid) during execution |
+| **Rate Limit** | A restriction on how many API calls you can make in a time period (to prevent abuse) |
+| **Rewrite Table** | A Matillion component that creates/replaces a table with the output of a transformation |
+| **Schedule** | An automated trigger that runs a pipeline at specified times (e.g., daily at 3 AM) |
+| **Sub-Pipeline** | A pipeline called from another pipeline — allows modular, reusable design |
+| **Transition** | A connection between orchestration components that defines execution order and conditions |
 
 ---
 
