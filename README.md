@@ -39,7 +39,7 @@ This pipeline **automatically finds and fixes Fivetran connectors that broke bec
 
 | Reader | What to Focus On |
 |---|---|
-| **Data Analysts** (like Avinash) | Sections 1-4 for understanding, Section 11 for querying the log table, Section 15 for FAQ |
+| **Data Analysts**  | Sections 1-4 for understanding, Section 11 for querying the log table, Section 15 for FAQ |
 | **Data Engineers** | Sections 5-8 for pipeline architecture, Section 10 for internal mechanics |
 | **DevOps / Platform Engineers** | Section 13 for setup, Section 14 for error handling |
 | **Managers / Stakeholders** | Section 1 (business value), Section 9 (data flow overview) |
